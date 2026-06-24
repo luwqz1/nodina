@@ -1,6 +1,6 @@
 <div align="center">
   <a href="https://github.com/luwqz1/nodina">
-    <img src="https://raw.githubusercontent.com/luwqz1/nodina/refs/heads/dev/assets/logo.svg" alt="Nodina Logo" width="160" height="160">
+    <img src="https://raw.githubusercontent.com/luwqz1/nodina/refs/heads/main/assets/logo.svg" alt="Nodina Logo" width="160" height="160">
   </a>
 
   ⚡️ <i>Ultra fast agents for <a href="https://github.com/timoniq/nodnod">nodnod</i></a> \

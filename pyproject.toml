@@ -14,7 +14,8 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-  "pytest>=9.0.2",
+  "ruff>=0.15.19,<1",
+  "pytest>=8.3.4",
   "pytest-asyncio>=1.3.0",
   "cython>=3.2.6",
   "setuptools>=82.0.1",
@@ -23,7 +24,56 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 
 [tool.ruff]
-line-length = 115
+line-length = 120
 target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+  "I",
+  "D",
+  "N",
+  "PLR",
+  "Q",
+  "COM",
+  "TC",
+  "YTT",
+  "SIM",
+  "RUF022",
+]
+ignore = [
+  "COM812",
+  "N805",
+  "N818",
+  "TC001",
+  "TC002",
+  "TC003",
+  "TC004",
+  "D100",
+  "D101",
+  "D102",
+  "D103",
+  "D104",
+  "D105",
+  "D107",
+  "D202",
+  "D203",
+  "D205",
+  "D209",
+  "D211",
+  "D213",
+  "D400",
+  "D401",
+  "D404",
+  "D415",
+  "N802",
+  "PLR2004",
+  "PLR0911",
+  "PLR0912",
+  "PLR0913"
+]
+fixable = ["ALL"]
+unfixable = ["ERA"]
+exclude = [".venv", ".idea", ".cache", "build"]

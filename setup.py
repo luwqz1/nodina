@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import os
-import platform
 import pathlib
+import platform
 import shlex
 import tarfile
 import urllib.request

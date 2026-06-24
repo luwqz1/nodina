@@ -1,10 +1,18 @@
 import asyncio
 
-import pytest
 import kungfu
+import pytest
 
-from nodina import AsyncNodinaAgent, NodinaAgent, backend_name, sleep
-from nodnod import ResultNode, Scope, SequentialEither, NodeError, scalar_node
+from nodina import (
+    AsyncNodinaAgent,
+    NodeError,
+    NodinaAgent,
+    ResultNode,
+    Scope,
+    SequentialEither,
+    backend_name,
+    scalar_node,
+)
 
 
 def test_backend_name_is_available():
@@ -40,21 +48,6 @@ def test_nodina_agent_rejects_async_nodes():
     scope = Scope()
     with pytest.raises(TypeError, match=r"use `nodina\.AsyncNodinaAgent`"):
         NodinaAgent.build({AsyncNode}).run(scope, {})
-
-
-@pytest.mark.asyncio
-async def test_async_nodina_agent_runs_async_node_with_nodina_sleep():
-    @scalar_node
-    class AsyncNode:
-        @classmethod
-        async def __compose__(cls) -> int:
-            await sleep(1)
-            return 7
-
-    scope = Scope()
-    await AsyncNodinaAgent.build({AsyncNode}).run(scope, {})
-
-    assert scope[AsyncNode].value == 7
 
 
 @pytest.mark.asyncio

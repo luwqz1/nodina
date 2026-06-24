@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1200" height="900" viewBox="0 0 1200 900" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">nodina logo</title>
+  <desc id="desc">Pink and black logo with an acyclic family descendant graph, person nodes, cursive nodina text, and a cursor.</desc>
+
+  <defs>
+    <linearGradient id="pinkGlow" x1="210" y1="80" x2="980" y2="760" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FF7AC3"/>
+      <stop offset="0.52" stop-color="#FF4FA3"/>
+      <stop offset="1" stop-color="#FF2E8A"/>
+    </linearGradient>
+
+    <filter id="softShadow" x="-30%" y="-30%" width="160%" height="160%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#0B0B0F" flood-opacity="0.18"/>
+    </filter>
+
+    <filter id="pinkBlur" x="-50%" y="-50%" width="200%" height="200%" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+
+    <marker id="arrowPink" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#FF4FA3"/>
+    </marker>
+
+    <symbol id="person" viewBox="-50 -50 100 100">
+      <circle cx="0" cy="-14" r="16" fill="#0B0B0F"/>
+      <path d="M-29 29C-24 8 -11 -1 0 -1C11 -1 24 8 29 29C15 38 -15 38 -29 29Z" fill="#0B0B0F"/>
+    </symbol>
+
+    <style>
+      .edge {
+        stroke: #FF4FA3;
+        stroke-width: 8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+        marker-end: url(#arrowPink);
+      }
+      .node-ring {
+        fill: #FFFFFF;
+        stroke: #0B0B0F;
+        stroke-width: 7;
+      }
+      .node-ring-pink {
+        fill: #FFFFFF;
+        stroke: #FF4FA3;
+        stroke-width: 7;
+      }
+      .script {
+        font-family: "Pacifico", "Brush Script MT", "Segoe Script", "Apple Chancery", cursive;
+        font-size: 150px;
+        font-weight: 700;
+        letter-spacing: 1px;
+      }
+    </style>
+  </defs>
+
+  <!-- Family DAG group -->
+  <g filter="url(#softShadow)">
+    <!-- Edges: parent to descendants, strictly downward, acyclic -->
+    <path class="edge" d="M600 154 C600 204 445 206 445 257"/>
+    <path class="edge" d="M600 154 C600 204 600 206 600 257"/>
+    <path class="edge" d="M600 154 C600 204 755 206 755 257"/>
+
+    <path class="edge" d="M445 329 C445 374 342 378 342 424"/>
+    <path class="edge" d="M445 329 C445 374 485 379 485 424"/>
+
+    <path class="edge" d="M600 329 C600 374 600 378 600 424"/>
+
+    <path class="edge" d="M755 329 C755 374 715 379 715 424"/>
+    <path class="edge" d="M755 329 C755 374 858 378 858 424"/>
+
+    <path class="edge" d="M342 496 C342 538 485 538 485 580"/>
+    <path class="edge" d="M600 496 C600 538 485 538 485 580"/>
+    <path class="edge" d="M715 496 C715 538 715 538 715 580"/>
+    <path class="edge" d="M858 496 C858 538 715 538 715 580"/>
+
+    <!-- Nodes -->
+    <g transform="translate(600 118)">
+      <circle class="node-ring-pink" r="56"/>
+      <circle r="46" fill="#FF4FA3" opacity="0.14"/>
+      <use href="#person" width="72" height="72" x="-36" y="-36"/>
+    </g>
+
+    <g transform="translate(445 293)">
+      <circle class="node-ring" r="54"/>
+      <circle r="43" fill="#FF4FA3" opacity="0.10"/>
+      <use href="#person" width="68" height="68" x="-34" y="-34"/>
+    </g>
+
+    <g transform="translate(600 293)">
+      <circle class="node-ring" r="54"/>
+      <circle r="43" fill="#FF4FA3" opacity="0.10"/>
+      <use href="#person" width="68" height="68" x="-34" y="-34"/>
+    </g>
+
+    <g transform="translate(755 293)">
+      <circle class="node-ring" r="54"/>
+      <circle r="43" fill="#FF4FA3" opacity="0.10"/>
+      <use href="#person" width="68" height="68" x="-34" y="-34"/>
+    </g>
+
+    <g transform="translate(342 460)">
+      <circle class="node-ring-pink" r="50"/>
+      <use href="#person" width="62" height="62" x="-31" y="-31"/>
+    </g>
+
+    <g transform="translate(485 460)">
+      <circle class="node-ring" r="50"/>
+      <use href="#person" width="62" height="62" x="-31" y="-31"/>
+    </g>
+
+    <g transform="translate(600 460)">
+      <circle class="node-ring-pink" r="50"/>
+      <use href="#person" width="62" height="62" x="-31" y="-31"/>
+    </g>
+
+    <g transform="translate(715 460)">
+      <circle class="node-ring" r="50"/>
+      <use href="#person" width="62" height="62" x="-31" y="-31"/>
+    </g>
+
+    <g transform="translate(858 460)">
+      <circle class="node-ring-pink" r="50"/>
+      <use href="#person" width="62" height="62" x="-31" y="-31"/>
+    </g>
+
+    <g transform="translate(485 616)">
+      <circle class="node-ring" r="48"/>
+      <circle r="38" fill="#FF4FA3" opacity="0.11"/>
+      <use href="#person" width="58" height="58" x="-29" y="-29"/>
+    </g>
+
+    <g transform="translate(715 616)">
+      <circle class="node-ring-pink" r="48"/>
+      <circle r="38" fill="#FF4FA3" opacity="0.11"/>
+      <use href="#person" width="58" height="58" x="-29" y="-29"/>
+    </g>
+  </g>
+
+  <!-- Bottom wordmark -->
+  <g transform="translate(0 0)">
+    <text x="600" y="805" text-anchor="middle" class="script" fill="#0B0B0F">nodina</text>
+    <text x="604" y="805" text-anchor="middle" class="script" fill="none" stroke="url(#pinkGlow)" stroke-width="3" opacity="0.95">nodina</text>
+  </g>
+
+</svg>

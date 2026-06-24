@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=82.0.1", "wheel>=0.47.0", "cython>=3.2.6"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nodina"
+version = "0.1.0"
+description = "Ultra fast agents for nodnod"
+readme = "README.md"
+requires-python = ">=3.13,<4.0"
+dependencies = [
+  "nodnod>=1.0.2",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=9.0.2",
+  "pytest-asyncio>=1.3.0",
+  "cython>=3.2.6",
+  "setuptools>=82.0.1",
+  "wheel>=0.47.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 115
+target-version = "py313"

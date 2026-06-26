@@ -184,6 +184,16 @@ def _run_subtree(agent, traverse, local_scope, mapped_scopes, results, async_mod
 
 
 def _compose_either(agent, node, node_scope, local_scope, mapped_scopes, results, async_mode):
+    """Select the first *successful* either candidate in declared order.
+
+    This is the same for SequentialEither and ConcurrentEither: nodina does not
+    race by completion time and does not cancel losing candidates. The kinds
+    differ only in how their candidates get scheduled, via the dependency set
+    nodnod derives from ``is_concurrent`` -- ConcurrentEither lists every
+    candidate as a dependency (so the scheduler composes them all, concurrently,
+    before this runs), while SequentialEither lists only the first (so this
+    composes the rest lazily, stopping at the first success).
+    """
     errors: list = []
     for dependency in node.__either__:
         result = results.get(dependency)

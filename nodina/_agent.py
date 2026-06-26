@@ -7,11 +7,14 @@ work callback was ``with gil``, so nodes never ran in parallel), ~3.3x *slower*
 than a plain ``ThreadPoolExecutor`` on blocking work, and broken for real
 asyncio futures. So libuv — and Cython — were dropped.
 
-* ``NodinaAgent`` (sync) resolves the DAG in dependency order, offloading
-  independent nodes onto a shared, lazily created ``ThreadPoolExecutor`` so that
-  blocking (GIL-releasing) nodes overlap.
-* ``AsyncNodinaAgent`` resolves the DAG on the running asyncio event loop, one
-  task per node.
+The DAG resolution is written once, as a generator-based compose core
+(``_compose_from_results`` and friends). The sync agent drives that core to
+completion on a thread (a sync node never suspends); the async agent awaits it
+on the event loop. The only place the two diverge is the *scheduler*:
+
+* ``NodinaAgent`` (sync) offloads independent nodes onto a shared, lazily
+  created ``ThreadPoolExecutor`` so blocking (GIL-releasing) nodes overlap.
+* ``AsyncNodinaAgent`` schedules one asyncio task per node.
 """
 
 from __future__ import annotations
@@ -78,7 +81,7 @@ def _native_visit(node, queue: list, seen: set, visiting: set) -> None:
     queue.append(node)
 
 
-# --- shared node-model helpers --------------------------------------------
+# --- dependency resolution -------------------------------------------------
 
 
 def _node_dependencies(node, local_scope) -> set:
@@ -108,17 +111,6 @@ def _either_dependencies(node, local_scope, winner) -> set:
     return dependencies
 
 
-def _compose_result_node(node, node_scope, from_result):
-    if kungfu.is_err(from_result):
-        if not node.__compose__(from_result.error):
-            raise from_result.error
-        value = Value(node.__type__, from_result)
-    else:
-        value = Value(node.__type__, kungfu.Ok(from_result.value.value))
-    node_scope[node] = value
-    return kungfu.Ok(value)
-
-
 def _dependency_errors(node, results) -> list:
     return [
         results[dependency].error
@@ -138,23 +130,37 @@ def _dependency_failure_result(node, results):
     return None
 
 
-# --- sync composition ------------------------------------------------------
+# --- unified compose core --------------------------------------------------
+#
+# Every function below is a generator so it can `yield from` in async mode. In
+# sync mode none of them ever yield (a sync node returns a plain value, never an
+# awaitable), so the sync driver runs them straight to their `return`.
 
 
-def _sync_initialize_node(cls, value):
+def _initialize_value(cls, value, async_mode):
     if inspect.isawaitable(value):
-        if hasattr(value, "close"):
-            value.close()
-        raise TypeError(f"`{cls.__name__}` returned an awaitable; use `nodina.AsyncNodinaAgent`")
+        if not async_mode:
+            if hasattr(value, "close"):
+                value.close()
+            raise TypeError(f"`{cls.__name__}` returned an awaitable; use `nodina.AsyncNodinaAgent`")
+        # Drive the coroutine via its own __await__ -- i.e. exactly what `await`
+        # does -- so asyncio handles any real future it suspends on.
+        value = yield from value.__await__()
+
     if isinstance(value, types.AsyncGeneratorType):
-        raise TypeError(f"`{cls.__name__}` returned an async generator; use `nodina.AsyncNodinaAgent`")
+        if not async_mode:
+            raise TypeError(f"`{cls.__name__}` returned an async generator; use `nodina.AsyncNodinaAgent`")
+        generated = (yield from generator_asend(value).__await__()).expect("Generator did not generate any value")
+        return Value(cls, generated, generator=value)
+
     if isinstance(value, types.GeneratorType):
         generated = generator_send(value).expect("Generator did not generate any value")
         return Value(cls, generated, generator=value)
+
     return Value(cls, value)
 
 
-def _compose_sync_node(node, node_scope, local_scope, winner=None):
+def _compose_node(node, node_scope, local_scope, async_mode, winner=None):
     cached = node_scope.retrieve(node)
     if cached:
         return kungfu.Ok(cached.unwrap())
@@ -164,13 +170,20 @@ def _compose_sync_node(node, node_scope, local_scope, winner=None):
         else:
             dependencies = _node_dependencies(node, local_scope)
         value = node.__initialize__(dependencies)
-        node_scope[node] = _sync_initialize_node(node.__type__, value)
+        node_scope[node] = yield from _initialize_value(node.__type__, value, async_mode)
     except NodeError as e:
         return kungfu.Error(NodeError(f"failed to compose `{node.__name__}`", from_error=e))
     return kungfu.Ok(node_scope[node])
 
 
-def _compose_either_sync(agent, node, node_scope, local_scope, mapped_scopes, results):
+def _run_subtree(agent, traverse, local_scope, mapped_scopes, results, async_mode):
+    if async_mode:
+        yield from agent._run_async_nodes(traverse, local_scope, mapped_scopes, results)
+    else:
+        agent._run_sync_nodes(traverse, local_scope, mapped_scopes, results)
+
+
+def _compose_either(agent, node, node_scope, local_scope, mapped_scopes, results, async_mode):
     errors: list = []
     for dependency in node.__either__:
         result = results.get(dependency)
@@ -178,119 +191,58 @@ def _compose_either_sync(agent, node, node_scope, local_scope, mapped_scopes, re
             traverse = getattr(dependency, "__traverse__", None)
             if traverse is None:
                 traverse = _native_traverse({dependency})
-            agent._run_sync_nodes(traverse, local_scope, mapped_scopes, results)
+            yield from _run_subtree(agent, traverse, local_scope, mapped_scopes, results, async_mode)
             result = results.get(dependency)
         if result is not None and result:
             scope = mapped_scopes.get(dependency, local_scope)
             scope[dependency] = result.unwrap()
-            return _compose_sync_node(node, node_scope, local_scope, result.unwrap())
+            return (yield from _compose_node(node, node_scope, local_scope, async_mode, result.unwrap()))
         if result is not None:
             errors.append(result.error)
     return kungfu.Error(NodeError("no option found for either", from_many=errors))
 
 
-def _compose_sync_node_from_results(agent, node, node_scope, local_scope, mapped_scopes, results):
+def _compose_result_node(node, node_scope, from_result):
+    if kungfu.is_err(from_result):
+        if not node.__compose__(from_result.error):
+            raise from_result.error
+        value = Value(node.__type__, from_result)
+    else:
+        value = Value(node.__type__, kungfu.Ok(from_result.value.value))
+    node_scope[node] = value
+    return kungfu.Ok(value)
+
+
+def _compose_from_results(agent, node, node_scope, local_scope, mapped_scopes, results, async_mode):
     if issubclass(node, ResultNode):
         dep_result = results.get(node.__from_node__)
         if dep_result is None:
             return kungfu.Error(NodeError(f"could not resolve dependencies of `{node.__name__}`"))
         return _compose_result_node(node, node_scope, dep_result)
     if hasattr(node, "__either__"):
-        return _compose_either_sync(agent, node, node_scope, local_scope, mapped_scopes, results)
-    return _compose_sync_node(node, node_scope, local_scope)
+        return (yield from _compose_either(agent, node, node_scope, local_scope, mapped_scopes, results, async_mode))
+    return (yield from _compose_node(node, node_scope, local_scope, async_mode))
 
 
-# --- async composition -----------------------------------------------------
+# --- drivers ---------------------------------------------------------------
 
 
-def _drive_awaitable(awaitable):
-    iterator = awaitable.__await__()
-    send_value = None
-    while True:
-        try:
-            yielded = iterator.send(send_value)
-            send_value = None
-        except StopIteration as stop:
-            return stop.value
-
-        if yielded is None:
-            send_value = yield None
-            continue
-        if asyncio.isfuture(yielded):
-            send_value = yield from yielded.__await__()
-            continue
-        if inspect.isawaitable(yielded):
-            send_value = yield from _drive_awaitable(yielded)
-            continue
-        send_value = yield yielded
-
-
-def _async_initialize_node(cls, value):
-    if inspect.isawaitable(value):
-        value = yield from _drive_awaitable(value)
-    if isinstance(value, types.GeneratorType):
-        generated = generator_send(value).expect("Generator did not generate any value")
-        return Value(cls, generated, generator=value)
-    if isinstance(value, types.AsyncGeneratorType):
-        generated = (yield from _drive_awaitable(generator_asend(value))).expect(
-            "Generator did not generate any value",
-        )
-        return Value(cls, generated, generator=value)
-    return Value(cls, value)
-
-
-def _compose_async_node(node, node_scope, local_scope, winner=None):
-    cached = node_scope.retrieve(node)
-    if cached:
-        return kungfu.Ok(cached.unwrap())
+def _drive_sync(compose):
+    """Run a compose generator to completion; a sync node must never suspend."""
     try:
-        if hasattr(node, "__either__"):
-            dependencies = _either_dependencies(node, local_scope, winner)
-        else:
-            dependencies = _node_dependencies(node, local_scope)
-        value = node.__initialize__(dependencies)
-        node_scope[node] = yield from _async_initialize_node(node.__type__, value)
-    except NodeError as e:
-        return kungfu.Error(NodeError(f"failed to compose `{node.__name__}`", from_error=e))
-    return kungfu.Ok(node_scope[node])
+        compose.send(None)
+    except StopIteration as stop:
+        return stop.value
+    raise RuntimeError("sync composition unexpectedly awaited")  # pragma: no cover
 
 
-def _compose_either_async(agent, node, node_scope, local_scope, mapped_scopes, results):
-    errors: list = []
-    for dependency in node.__either__:
-        result = results.get(dependency)
-        if result is None:
-            traverse = getattr(dependency, "__traverse__", None)
-            if traverse is None:
-                traverse = _native_traverse({dependency})
-            yield from agent._run_async_nodes(traverse, local_scope, mapped_scopes, results)
-            result = results.get(dependency)
-        if result is not None and result:
-            scope = mapped_scopes.get(dependency, local_scope)
-            scope[dependency] = result.unwrap()
-            return (yield from _compose_async_node(node, node_scope, local_scope, result.unwrap()))
-        if result is not None:
-            errors.append(result.error)
-    return kungfu.Error(NodeError("no option found for either", from_many=errors))
-
-
-def _compose_async_node_from_results(agent, node, node_scope, local_scope, mapped_scopes, results):
-    if issubclass(node, ResultNode):
-        dep_result = results.get(node.__from_node__)
-        if dep_result is None:
-            return kungfu.Error(NodeError(f"could not resolve dependencies of `{node.__name__}`"))
-        return _compose_result_node(node, node_scope, dep_result)
-    if hasattr(node, "__either__"):
-        return (yield from _compose_either_async(agent, node, node_scope, local_scope, mapped_scopes, results))
-    return (yield from _compose_async_node(node, node_scope, local_scope))
+def _compose_sync(node, node_scope, local_scope):
+    return _drive_sync(_compose_node(node, node_scope, local_scope, False))
 
 
 class _GenAwaitable:
-    """Adapts a nodina compose generator into an awaitable.
-
-    asyncio's ``create_task`` only accepts native coroutines; a bare generator
-    (even ``yield from``-based) is rejected, so we wrap it.
-    """
+    """Adapts a compose generator into an awaitable (asyncio.create_task only
+    accepts native coroutines, not bare generators)."""
 
     __slots__ = ("_gen",)
 
@@ -303,6 +255,19 @@ class _GenAwaitable:
 
 async def _as_coroutine(gen):
     return await _GenAwaitable(gen)
+
+
+def _settle_failure(node, results, final_nodes) -> bool:
+    """Record a dependency failure for ``node`` if it has one. Returns True if
+    the node was settled (so it should not be composed), raising if it is a
+    failed final node."""
+    failure = _dependency_failure_result(node, results)
+    if failure is None:
+        return False
+    results[node] = failure
+    if kungfu.is_err(failure) and node in final_nodes:
+        raise failure.error
+    return True
 
 
 # --- agents ----------------------------------------------------------------
@@ -345,11 +310,7 @@ class NodinaAgent(AgentMixin, Agent):
                 pending_set.discard(node)
                 progressed = True
 
-                failure = _dependency_failure_result(node, results)
-                if failure is not None:
-                    results[node] = failure
-                    if kungfu.is_err(failure) and node in self.final_nodes:
-                        raise failure.error
+                if _settle_failure(node, results, self.final_nodes):
                     continue
 
                 # Either/result resolution can recurse into _run_sync_nodes, so it
@@ -357,10 +318,10 @@ class NodinaAgent(AgentMixin, Agent):
                 # nested-loop re-entrancy the old libuv path suffered from.
                 if issubclass(node, ResultNode) or hasattr(node, "__either__"):
                     node_scope = mapped_scopes.get(node, local_scope)
-                    result = _compose_sync_node_from_results(
-                        self, node, node_scope, local_scope, mapped_scopes, results,
+                    result = _drive_sync(
+                        _compose_from_results(self, node, node_scope, local_scope, mapped_scopes, results, False),
                     )
-                    self._record_sync(node, node_scope, result, results)
+                    self._record(node, node_scope, result, results)
                 else:
                     ready_plain.append(node)
 
@@ -370,16 +331,16 @@ class NodinaAgent(AgentMixin, Agent):
             if len(ready_plain) == 1 and not running:
                 node = ready_plain[0]
                 node_scope = mapped_scopes.get(node, local_scope)
-                self._record_sync(node, node_scope, _compose_sync_node(node, node_scope, local_scope), results)
+                self._record(node, node_scope, _compose_sync(node, node_scope, local_scope), results)
             else:
                 for node in ready_plain:
-                    running[pool.submit(_compose_sync_node, node, mapped_scopes.get(node, local_scope), local_scope)] = node
+                    running[pool.submit(_compose_sync, node, mapped_scopes.get(node, local_scope), local_scope)] = node
 
             if running:
                 done, _ = wait(running, return_when=FIRST_COMPLETED)
                 for future in done:
                     node = running.pop(future)
-                    self._record_sync(node, mapped_scopes.get(node, local_scope), future.result(), results)
+                    self._record(node, mapped_scopes.get(node, local_scope), future.result(), results)
                     progressed = True
             elif not progressed and pending_set:
                 node = next(iter(pending_set))
@@ -387,7 +348,7 @@ class NodinaAgent(AgentMixin, Agent):
 
             pending = [node for node in pending if node in pending_set]
 
-    def _record_sync(self, node, node_scope, result, results) -> None:
+    def _record(self, node, node_scope, result, results) -> None:
         results[node] = result
         if result is not None and result:
             node_scope[node] = result.unwrap()
@@ -439,19 +400,13 @@ class AsyncNodinaAgent(AgentMixin, Agent):
                 pending.remove(node)
                 progressed = True
 
-                result = _dependency_failure_result(node, results)
-                if result is not None:
-                    results[node] = result
-                    if kungfu.is_err(result) and node in self.final_nodes:
-                        raise result.error
+                if _settle_failure(node, results, self.final_nodes):
                     continue
 
                 node_scope = mapped_scopes.get(node, local_scope)
                 task = asyncio.create_task(
                     _as_coroutine(
-                        _compose_async_node_from_results(
-                            self, node, node_scope, local_scope, mapped_scopes, results,
-                        ),
+                        _compose_from_results(self, node, node_scope, local_scope, mapped_scopes, results, True),
                     ),
                 )
                 running[task] = (node, node_scope)

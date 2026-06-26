@@ -92,6 +92,52 @@ async def test_async_nodina_agent_runs_async_node_with_asyncio_sleep():
 
 
 @pytest.mark.asyncio
+async def test_async_nodina_agent_drives_real_asyncio_future():
+    # Regression: a node that awaits a *real* future (asyncio.sleep > 0, not the
+    # sleep(0) no-op) used to raise "await wasn't used with future" because the
+    # compose driver double-stepped the future.
+    @scalar_node
+    class Slow:
+        @classmethod
+        async def __compose__(cls) -> int:
+            await asyncio.sleep(0.01)
+            return 7
+
+    scope = Scope()
+    await AsyncNodinaAgent.build({Slow}).run(scope, {})
+
+    assert scope[Slow].value == 7
+
+
+@pytest.mark.asyncio
+async def test_async_nodina_agent_runs_independent_async_nodes_concurrently():
+    # Real asyncio concurrency: two independent nodes that each await 0.1s must
+    # overlap and finish in well under 0.2s.
+    @scalar_node
+    class A:
+        @classmethod
+        async def __compose__(cls) -> int:
+            await asyncio.sleep(0.1)
+            return 1
+
+    @scalar_node
+    class B:
+        @classmethod
+        async def __compose__(cls) -> int:
+            await asyncio.sleep(0.1)
+            return 2
+
+    scope = Scope()
+    started = time.perf_counter()
+    await AsyncNodinaAgent.build({A, B}).run(scope, {})
+    elapsed = time.perf_counter() - started
+
+    assert scope[A].value == 1
+    assert scope[B].value == 2
+    assert elapsed < 0.18
+
+
+@pytest.mark.asyncio
 async def test_async_nodina_agent_runs_async_generator():
     closed = False
 

@@ -1,28 +1,25 @@
 [build-system]
-requires = ["setuptools>=82.0.1", "wheel>=0.47.0"]
+requires = ["setuptools>=82.0.1", "wheel>=0.47.0", "cython>=3.2.6"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "nodina"
 version = "0.1.0"
-description = "asyncio/threadpool DAG scheduler agents for nodnod"
+description = "Ultra fast agents for nodnod"
 readme = "README.md"
 requires-python = ">=3.13,<4.0"
 dependencies = [
   "nodnod>=1.0.2",
 ]
 
-[tool.setuptools]
-packages = ["nodina"]
-
-[tool.setuptools.package-data]
-nodina = ["py.typed", "__init__.pyi"]
-
 [dependency-groups]
 dev = [
   "ruff>=0.15.20",
   "pytest>=9.1.1",
   "pytest-asyncio>=1.4.0",
+  "cython>=3.2.6",
+  "setuptools>=82.0.1",
+  "wheel>=0.47.0",
 ]
 
 [tool.pytest.ini_options]
@@ -79,7 +76,7 @@ ignore = [
 ]
 fixable = ["ALL"]
 unfixable = ["ERA"]
-exclude = [".venv", ".idea", ".cache", ".pytest_cache", "build"]
+exclude = [".venv", ".idea", ".cache", ".pytest_cache", "build", "vendor/libuv"]
 
 [tool.pyright]
 exclude = [
@@ -88,6 +85,7 @@ exclude = [
   ".cache",
   ".ruff_cache",
   ".pytest_cache",
+  "vendor/libuv",
   "tests",
 ]
 typeCheckingMode = "basic"

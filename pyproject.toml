@@ -14,9 +14,9 @@ dependencies = [
 
 [dependency-groups]
 dev = [
-  "ruff>=0.15.19,<1",
-  "pytest>=8.3.4",
-  "pytest-asyncio>=1.3.0",
+  "ruff>=0.15.20",
+  "pytest>=9.1.1",
+  "pytest-asyncio>=1.4.0",
   "cython>=3.2.6",
   "setuptools>=82.0.1",
   "wheel>=0.47.0",
@@ -76,4 +76,20 @@ ignore = [
 ]
 fixable = ["ALL"]
 unfixable = ["ERA"]
-exclude = [".venv", ".idea", ".cache", "build"]
+exclude = [".venv", ".idea", ".cache", ".pytest_cache", "build"]
+
+[tool.pyright]
+exclude = [
+  ".venv",
+  ".idea",
+  ".cache",
+  ".ruff_cache",
+  ".pytest_cache",
+  "tests",
+]
+typeCheckingMode = "basic"
+pythonPlatform = "All"
+pythonVersion = "3.14"
+reportMissingImports = true
+reportMissingTypeStubs = false
+reportSelfClsParameterName = false

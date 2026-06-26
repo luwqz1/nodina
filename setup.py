@@ -4,60 +4,33 @@ import os
 import pathlib
 import platform
 import shlex
-import tarfile
-import urllib.request
 
 from setuptools import Extension, setup
 
 try:
-    from Cython.Build import cythonize  # type: ignore
+    from Cython.Build import cythonize
 except ImportError as exc:  # pragma: no cover - setup-time guard
     raise SystemExit("Cython is required to build nodina. Install it with `uv add --dev cython`.") from exc
 
-
 ROOT = pathlib.Path(__file__).parent.resolve()
-LIBUV_COMMIT = "1cfa32ff59c076ffb6ed735bbc8c18361558661f"
-LIBUV_URL = f"https://github.com/libuv/libuv/archive/{LIBUV_COMMIT}.tar.gz"
-LIBUV_CACHE = pathlib.Path(".cache") / f"libuv-{LIBUV_COMMIT}"
 
 
 def ensure_libuv() -> pathlib.Path:
     env_source_dir = os.environ.get("NODINA_LIBUV_SOURCE_DIR")
+
     if env_source_dir:
         source_dir = pathlib.Path(env_source_dir)
+
         if not (source_dir / "include" / "uv.h").exists():
             raise RuntimeError(f"NODINA_LIBUV_SOURCE_DIR does not look like libuv source: {source_dir}")
         return source_dir
 
-    if (LIBUV_CACHE / "include" / "uv.h").exists():
-        return LIBUV_CACHE
+    libuv = pathlib.Path("vendor") / "libuv"
 
-    LIBUV_CACHE.parent.mkdir(parents=True, exist_ok=True)
-    archive_path = LIBUV_CACHE.parent / f"libuv-{LIBUV_COMMIT}.tar.gz"
-    if not archive_path.exists():
-        urllib.request.urlretrieve(LIBUV_URL, archive_path)
+    if (libuv / "include" / "uv.h").exists():
+        return libuv
 
-    extract_dir = LIBUV_CACHE.parent / f"libuv-{LIBUV_COMMIT}.tmp"
-    if extract_dir.exists():
-        import shutil
-
-        shutil.rmtree(extract_dir)
-    extract_dir.mkdir(parents=True)
-
-    with tarfile.open(archive_path, "r:gz") as archive:
-        for member in archive.getmembers():
-            target = (extract_dir / member.name).resolve()
-            if not target.is_relative_to(extract_dir.resolve()):
-                raise RuntimeError(f"unsafe path in libuv archive: {member.name}")
-        archive.extractall(extract_dir)
-
-    extracted_roots = [path for path in extract_dir.iterdir() if path.is_dir()]
-    if len(extracted_roots) != 1:
-        raise RuntimeError(f"unexpected libuv archive layout in {archive_path}")
-
-    extracted_roots[0].rename(LIBUV_CACHE)
-    extract_dir.rmdir()
-    return LIBUV_CACHE
+    raise LookupError("libuv vendor is not found")
 
 
 LIBUV = ensure_libuv()
@@ -85,6 +58,9 @@ COMMON_UV_SOURCES = uv_sources(
     "src/uv-common.c",
     "src/uv-data-getter-setters.c",
     "src/version.c",
+)
+
+UNIX_UV_SOURCES = uv_sources(
     "src/unix/async.c",
     "src/unix/core.c",
     "src/unix/dl.c",
@@ -105,6 +81,47 @@ COMMON_UV_SOURCES = uv_sources(
     "src/unix/udp.c",
 )
 
+WIN_UV_SOURCES = uv_sources(
+    "src/win/async.c",
+    "src/win/core.c",
+    "src/win/detect-wakeup.c",
+    "src/win/dl.c",
+    "src/win/error.c",
+    "src/win/fs.c",
+    "src/win/fs-event.c",
+    "src/win/getaddrinfo.c",
+    "src/win/getnameinfo.c",
+    "src/win/handle.c",
+    "src/win/loop-watcher.c",
+    "src/win/pipe.c",
+    "src/win/poll.c",
+    "src/win/process.c",
+    "src/win/process-stdio.c",
+    "src/win/signal.c",
+    "src/win/snprintf.c",
+    "src/win/stream.c",
+    "src/win/tcp.c",
+    "src/win/thread.c",
+    "src/win/tty.c",
+    "src/win/udp.c",
+    "src/win/util.c",
+    "src/win/winapi.c",
+    "src/win/winsock.c",
+)
+
+
+def compiler_args() -> list[str]:
+    if platform.system() == "Windows":
+        return ["/O2", *split_env("NODINA_CFLAGS")]
+
+    return [
+        "-O3",
+        "-fno-strict-aliasing",
+        "-Wno-unused-parameter",
+        "-Wno-unreachable-code",
+        *split_env("NODINA_CFLAGS"),
+    ]
+
 
 def platform_uv_config() -> tuple[list[str], list[tuple[str, str | None]], list[str], list[str]]:
     system = platform.system()
@@ -114,10 +131,12 @@ def platform_uv_config() -> tuple[list[str], list[tuple[str, str | None]], list[
         ("_FILE_OFFSET_BITS", "64"),
         ("_LARGEFILE_SOURCE", "1"),
     ]
-    libraries: list[str] = ["pthread"]
+    libraries: list[str] = []
     extra_link_args: list[str] = []
 
     if system == "Darwin":
+        sources.extend(UNIX_UV_SOURCES)
+        libraries.append("pthread")
         macros.extend(
             [
                 ("_DARWIN_UNLIMITED_SELECT", "1"),
@@ -137,6 +156,8 @@ def platform_uv_config() -> tuple[list[str], list[tuple[str, str | None]], list[
         )
         extra_link_args.extend(["-framework", "CoreServices", "-framework", "CoreFoundation"])
     elif system == "Linux":
+        sources.extend(UNIX_UV_SOURCES)
+        libraries.append("pthread")
         macros.extend(
             [
                 ("_GNU_SOURCE", "1"),
@@ -151,6 +172,41 @@ def platform_uv_config() -> tuple[list[str], list[tuple[str, str | None]], list[
                 "src/unix/procfs-exepath.c",
                 "src/unix/random-getrandom.c",
                 "src/unix/random-sysctl-linux.c",
+            )
+        )
+    elif system == "Windows":
+        sources.extend(WIN_UV_SOURCES)
+        macros = [
+            ("NODINA_HAVE_LIBUV", "1"),
+            ("WIN32_LEAN_AND_MEAN", "1"),
+            ("_WIN32_WINNT", "0x0602"),
+            ("_CRT_SECURE_NO_WARNINGS", "1"),
+        ]
+        libraries.extend(
+            [
+                "advapi32",
+                "iphlpapi",
+                "psapi",
+                "shell32",
+                "user32",
+                "userenv",
+                "ws2_32",
+            ]
+        )
+    elif system.startswith("CYGWIN") or system == "CYGWIN_NT":
+        sources.extend(UNIX_UV_SOURCES)
+        libraries.append("pthread")
+        macros.extend(
+            [
+                ("_GNU_SOURCE", "1"),
+                ("_POSIX_C_SOURCE", "200112"),
+            ]
+        )
+        sources.extend(
+            uv_sources(
+                "src/unix/no-proctitle.c",
+                "src/unix/cygwin.c",
+                "src/unix/random-getentropy.c",
             )
         )
     else:
@@ -173,12 +229,7 @@ extensions = [
         ],
         libraries=libraries,
         define_macros=macros,
-        extra_compile_args=[
-            "-O3",
-            "-fno-strict-aliasing",
-            "-Wno-unused-parameter",
-            *split_env("NODINA_CFLAGS"),
-        ],
+        extra_compile_args=compiler_args(),
         extra_link_args=[*uv_link_args, *split_env("NODINA_LDFLAGS")],
     )
 ]

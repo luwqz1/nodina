@@ -41,34 +41,48 @@ asyncio.run(main())
 
 ## How it works
 
-nodina is a small, pure-Python DAG scheduler for [nodnod](https://github.com/timoniq/nodnod)
-graphs. It ships two agents:
+nodina is a small DAG scheduler for [nodnod](https://github.com/timoniq/nodnod)
+graphs, built as a Cython extension over a tiny native (libuv-free) pthread work
+pool. It ships two agents:
 
 - **`AsyncNodinaAgent`** resolves the dependency graph on the running asyncio
   event loop — one task per node, so independent `async` nodes (and any node that
   awaits real I/O) run concurrently.
-- **`NodinaAgent`** resolves it synchronously, offloading independent nodes onto a
-  shared `ThreadPoolExecutor` so *blocking* (GIL-releasing) nodes overlap. A lone
-  ready node with nothing else in flight composes inline to skip a thread hand-off.
+- **`NodinaAgent`** resolves it synchronously, dispatching independent nodes onto
+  a shared pthread pool (`nodina/core/nodina_pool.c`). The pool's queueing and
+  waiting run **without the GIL** — the GIL is held only inside each `__compose__`
+  call. A lone ready node with nothing else in flight composes inline to skip a
+  thread hand-off.
 
 Both pick the first **successful** `SequentialEither` / `ConcurrentEither`
 candidate in declared order; `ConcurrentEither` composes all of its candidates
 concurrently, `SequentialEither` composes them lazily. Neither cancels losing
 candidates.
 
-### Performance, honestly
+### Performance & the GIL, honestly
 
-There is no native/C backend — `backend_name()` returns `"threadpool"`. The
-thread offload only helps nodes that **release the GIL** (blocking I/O, `time.sleep`,
-C extensions). **CPU-bound** `__compose__` work is GIL-serialized and will not run
-in parallel — use `AsyncNodinaAgent` with truly async I/O for real concurrency.
+`backend_name()` returns `"cython"`. The thread pool overlaps nodes that
+**release the GIL** (blocking I/O, `time.sleep`, C extensions). On a normal
+CPython build, **CPU-bound** `__compose__` work still serializes on the GIL —
+that is a property of the interpreter, not of nodina.
 
-The benchmark suite in [`benchmarks/`](benchmarks/) measures nodina against a
-~150-line pure-Python reference scheduler across CPU-bound, blocking-I/O, wide,
-deep, and either/result workloads. nodina is on par with or faster than that
-reference on every case; see [`benchmarks/BASELINE.md`](benchmarks/BASELINE.md)
-for the methodology and the pre-optimization numbers.
+On a **free-threaded build** (`python3.14t`, PEP 703) the GIL is gone and the
+pool runs CPU-bound nodes **truly in parallel**. The extension declares
+`freethreading_compatible`, so importing it does not re-enable the GIL:
+
+```text
+# 8 independent CPU nodes, 8-node graph, 11-core machine
+python3.14   (GIL):  8 nodes = 206 ms   speedup vs serial 1.0x
+python3.14t  (no GIL): 8 nodes =  40 ms   speedup vs serial 5.1x
+```
 
 ```bash
-uv run python -m benchmarks.bench
+uv run python -m benchmarks.bench               # vs a pure-Python reference
+python3.14t -m benchmarks.freethreading_demo    # CPU parallelism with the GIL off
 ```
+
+The benchmark suite in [`benchmarks/`](benchmarks/) measures nodina against a
+~150-line pure-Python reference scheduler. nodina ties or beats it on every case
+(deep chains and small graphs 3-4x faster); see
+[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) and
+[`benchmarks/BASELINE.md`](benchmarks/BASELINE.md).

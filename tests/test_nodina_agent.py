@@ -1,8 +1,13 @@
 import asyncio
+import sys
 import time
 
 import kungfu
 import pytest
+
+
+def _gil_enabled() -> bool:
+    return sys._is_gil_enabled() if hasattr(sys, "_is_gil_enabled") else True
 
 from nodina import (
     AsyncNodinaAgent,
@@ -25,7 +30,7 @@ def _cpu_spin(iterations: int) -> int:
 
 
 def test_backend_name_is_available():
-    assert backend_name() == "threadpool"
+    assert backend_name() == "cython"
 
 
 def test_nodina_agent_runs_sync_dependencies():
@@ -76,10 +81,11 @@ def test_nodina_agent_overlaps_blocking_sync_nodes():
     assert elapsed < 0.22
 
 
-def test_nodina_agent_serializes_cpu_bound_sync_nodes():
-    # The threadpool cannot parallelize CPU-bound nodes: they hold the GIL, so
-    # two independent CPU nodes take ~2x a single one. This pins the real (no
-    # CPU parallelism) behavior, in contrast to the I/O-overlap test above.
+def test_nodina_agent_cpu_parallelism_follows_gil():
+    # The native pool dispatches independent nodes to threads. On a normal
+    # (GIL) build, CPU-bound nodes still serialize on the GIL, so two of them
+    # cost ~2x one. On a free-threaded build (python3.14t) they run truly in
+    # parallel, so two cost ~1x one. This pins the real behavior either way.
     spins = 4_000_000
 
     @scalar_node
@@ -88,6 +94,7 @@ def test_nodina_agent_serializes_cpu_bound_sync_nodes():
         def __compose__(cls) -> int:
             return _cpu_spin(spins)
 
+    NodinaAgent.build({Solo}).run(Scope(), {})  # warm
     one_started = time.perf_counter()
     NodinaAgent.build({Solo}).run(Scope(), {})
     one = time.perf_counter() - one_started
@@ -104,13 +111,18 @@ def test_nodina_agent_serializes_cpu_bound_sync_nodes():
         def __compose__(cls) -> int:
             return _cpu_spin(spins)
 
+    agent = NodinaAgent.build({A, B})
+    agent.run(Scope(), {})  # warm
     two_started = time.perf_counter()
-    NodinaAgent.build({A, B}).run(Scope(), {})
+    agent.run(Scope(), {})
     two = time.perf_counter() - two_started
 
-    # If CPU work parallelized, `two` would be ~`one`. Because of the GIL it is
-    # not: two independent CPU nodes cost at least ~1.5x a single one.
-    assert two > 1.5 * one
+    if _gil_enabled():
+        # GIL serializes CPU work: two independent nodes cost clearly more.
+        assert two > 1.5 * one
+    else:
+        # Free-threaded: the two nodes overlap and stay close to a single one.
+        assert two < 1.5 * one
 
 
 def test_nodina_agent_rejects_async_nodes():

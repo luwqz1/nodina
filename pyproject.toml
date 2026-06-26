@@ -79,7 +79,7 @@ ignore = [
 ]
 fixable = ["ALL"]
 unfixable = ["ERA"]
-exclude = [".venv", ".idea", ".cache", ".pytest_cache", "build", "vendor/libuv"]
+exclude = [".venv", ".idea", ".cache", ".pytest_cache", "build"]
 
 [tool.pyright]
 exclude = [
@@ -88,7 +88,6 @@ exclude = [
   ".cache",
   ".ruff_cache",
   ".pytest_cache",
-  "vendor/libuv",
   "tests",
 ]
 typeCheckingMode = "basic"

@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import kungfu
 import pytest
@@ -11,6 +12,7 @@ from nodina import (
     Scope,
     SequentialEither,
     backend_name,
+    sleep,
     scalar_node,
 )
 
@@ -38,6 +40,31 @@ def test_nodina_agent_runs_sync_dependencies():
     assert scope[B].value == 15
 
 
+def test_nodina_agent_runs_independent_sync_nodes_concurrently():
+    @scalar_node
+    class A:
+        @classmethod
+        def __compose__(cls) -> int:
+            time.sleep(0.12)
+            return 10
+
+    @scalar_node
+    class B:
+        @classmethod
+        def __compose__(cls) -> int:
+            time.sleep(0.12)
+            return 20
+
+    scope = Scope()
+    started = time.perf_counter()
+    NodinaAgent.build({A, B}).run(scope, {})
+    elapsed = time.perf_counter() - started
+
+    assert scope[A].value == 10
+    assert scope[B].value == 20
+    assert elapsed < 0.22
+
+
 def test_nodina_agent_rejects_async_nodes():
     @scalar_node
     class AsyncNode:
@@ -63,6 +90,32 @@ async def test_async_nodina_agent_runs_async_node_with_asyncio_sleep():
     await AsyncNodinaAgent.build({AsyncNode}).run(scope, {})
 
     assert scope[AsyncNode].value == 8
+
+
+@pytest.mark.asyncio
+async def test_async_nodina_agent_runs_independent_async_nodes_concurrently():
+    @scalar_node
+    class A:
+        @classmethod
+        async def __compose__(cls) -> int:
+            await sleep(120)
+            return 10
+
+    @scalar_node
+    class B:
+        @classmethod
+        async def __compose__(cls) -> int:
+            await sleep(120)
+            return 20
+
+    scope = Scope()
+    started = time.perf_counter()
+    await AsyncNodinaAgent.build({A, B}).run(scope, {})
+    elapsed = time.perf_counter() - started
+
+    assert scope[A].value == 10
+    assert scope[B].value == 20
+    assert elapsed < 0.22
 
 
 @pytest.mark.asyncio

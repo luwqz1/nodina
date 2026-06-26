@@ -1,4 +1,3 @@
-from nodnod.agent import Agent
 from nodnod.error import NodeError
 from nodnod.interface import (
     ConcurrentEither,
@@ -24,7 +23,6 @@ from nodnod.value import Value
 from ._agent import AsyncNodinaAgent, NodinaAgent, backend_name  # type: ignore
 
 __all__ = (
-    "Agent",
     "AsyncNodinaAgent",
     "ConcurrentEither",
     "DataNode",

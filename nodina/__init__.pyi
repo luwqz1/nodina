@@ -31,7 +31,6 @@ class AsyncNodinaAgent(Agent):
 class NodinaAgent(Agent): ...
 
 __all__ = (
-    "Agent",
     "AsyncNodinaAgent",
     "ConcurrentEither",
     "DataNode",

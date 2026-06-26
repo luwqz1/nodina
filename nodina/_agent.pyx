@@ -40,9 +40,15 @@ from ._core cimport (
     nodina_run_state_new,
     nodina_uv_available,
     nodina_uv_backend_name,
+    nodina_uv_work,
+    nodina_uv_work_free,
+    nodina_uv_work_is_done,
+    nodina_uv_work_status,
     nodina_uv_runner,
     nodina_uv_runner_free,
     nodina_uv_runner_new,
+    nodina_uv_runner_queue_work,
+    nodina_uv_runner_run_once,
     nodina_uv_runner_sleep,
 )
 
@@ -439,6 +445,137 @@ cdef object _compose_either_sync(
     return kungfu.Error(NodeError("no option found for either", from_many=errors))
 
 
+cdef object _dependency_errors(object node, object results):
+    cdef list errors = []
+    cdef object dependency
+    cdef object dep_result
+
+    for dependency in getattr(node, "__dependencies__", ()):
+        dep_result = results.get(dependency)
+
+        if dep_result is not None and kungfu.is_err(dep_result):
+            errors.append(dep_result.error)
+
+    return errors
+
+
+cdef bint _node_dependencies_resolved(object node, object results):
+    cdef object dependency
+
+    for dependency in getattr(node, "__dependencies__", ()):
+        if dependency not in results:
+            return False
+
+    return True
+
+
+cdef object _dependency_failure_result(object node, object results):
+    cdef list errors = _dependency_errors(node, results)
+
+    if errors and not hasattr(node, "__either__") and not issubclass(node, _result_node_type()):
+        return kungfu.Error(NodeError(f"could not resolve dependencies of `{node.__name__}`", from_many=errors))
+
+    return None
+
+
+cdef object _compose_sync_node_from_results(
+    object agent,
+    object node,
+    object node_scope,
+    object local_scope,
+    object mapped_scopes,
+    object results,
+):
+    cdef object dep_result
+
+    if issubclass(node, _result_node_type()):
+        dep_result = results.get(node.__from_node__)
+
+        if dep_result is None:
+            return kungfu.Error(NodeError(f"could not resolve dependencies of `{node.__name__}`"))
+
+        return _compose_result_node(node, node_scope, dep_result)
+
+    if hasattr(node, "__either__"):
+        return _compose_either_sync(agent, node, node_scope, local_scope, mapped_scopes, results)
+
+    return _compose_sync_node(node, node_scope, local_scope)
+
+
+cdef class _UvWorkTask:
+    cdef nodina_uv_work *work
+    cdef object agent
+    cdef object node
+    cdef object node_scope
+    cdef object local_scope
+    cdef object mapped_scopes
+    cdef object results
+    cdef object result
+    cdef object error
+
+    def __cinit__(self):
+        self.work = NULL
+
+    def __init__(
+        self,
+        object agent,
+        object node,
+        object node_scope,
+        object local_scope,
+        object mapped_scopes,
+        object results,
+    ):
+        self.agent = agent
+        self.node = node
+        self.node_scope = node_scope
+        self.local_scope = local_scope
+        self.mapped_scopes = mapped_scopes
+        self.results = results
+        self.result = None
+        self.error = None
+
+    def __dealloc__(self):
+        if self.work != NULL:
+            nodina_uv_work_free(self.work)
+            self.work = NULL
+
+    cdef void start(self, _UvRunner runner):
+        cdef int rc
+        cdef nodina_uv_work *work = NULL
+
+        rc = nodina_uv_runner_queue_work(
+            runner.runner,
+            _uv_work_task_run,
+            _uv_work_task_done,
+            <void *> <PyObject *> self,
+            &work,
+        )
+        if rc != 0:
+            raise RuntimeError(f"libuv work queue failed: {rc}")
+
+        self.work = work
+
+
+cdef void _uv_work_task_run(void *data) noexcept with gil:
+    cdef _UvWorkTask task = <_UvWorkTask> data
+
+    try:
+        task.result = _compose_sync_node_from_results(
+            task.agent,
+            task.node,
+            task.node_scope,
+            task.local_scope,
+            task.mapped_scopes,
+            task.results,
+        )
+    except BaseException as exc:
+        task.error = exc
+
+
+cdef void _uv_work_task_done(void *data, int status) noexcept with gil:
+    pass
+
+
 def _drive_awaitable(object awaitable, _UvRunner runner):
     cdef object iterator
     cdef object yielded = None
@@ -454,7 +591,7 @@ def _drive_awaitable(object awaitable, _UvRunner runner):
             return stop.value
 
         if isinstance(yielded, _NodinaSleep):
-            runner.sleep((<_NodinaSleep> yielded).timeout_ms)
+            send_value = yield from asyncio.sleep((<_NodinaSleep> yielded).timeout_ms / 1000).__await__()
             continue
 
         if yielded is None:
@@ -564,6 +701,36 @@ def _compose_either_async(
     return kungfu.Error(NodeError("no option found for either", from_many=errors))
 
 
+def _compose_async_node_from_results(
+    object agent,
+    object node,
+    object node_scope,
+    object local_scope,
+    object mapped_scopes,
+    object results,
+    _UvRunner runner,
+):
+    cdef object dep_result
+
+    if issubclass(node, _result_node_type()):
+        dep_result = results.get(node.__from_node__)
+
+        if dep_result is None:
+            return kungfu.Error(NodeError(f"could not resolve dependencies of `{node.__name__}`"))
+
+        return _compose_result_node(node, node_scope, dep_result)
+
+    if hasattr(node, "__either__"):
+        return (yield from _compose_either_async(agent, node, node_scope, local_scope, mapped_scopes, results, runner))
+
+    return (yield from _compose_async_node(node, node_scope, local_scope, runner))
+
+
+@types.coroutine
+def _run_async_generator(object awaitable):
+    return (yield from awaitable)
+
+
 cdef class AgentMixin:
     @classmethod
     def build(cls, nodes):
@@ -600,57 +767,88 @@ cdef class NodinaAgent(AgentMixin, Agent):
         cdef _RunState state = _RunState(len(nodes))
         cdef Py_ssize_t i
         cdef object node
-        cdef object dependency
-        cdef object dep_result
         cdef object result
         cdef object node_scope
-        cdef bint dependency_failed
-        cdef list errors
+        cdef object pending = set(nodes)
+        cdef dict index_by_node = {node: i for i, node in enumerate(nodes)}
+        cdef list running = []
+        cdef list completed = []
+        cdef _UvRunner runner = _UvRunner()
+        cdef _UvWorkTask task
+        cdef int rc
+        cdef bint progressed
 
-        for i, node in enumerate(nodes):
-            if node in results:
-                continue
+        pending.difference_update(results.keys())
 
-            with nogil:
-                self.native.mark_started(state.state, <size_t> i)
+        while pending or running:
+            progressed = False
 
-            node_scope = mapped_scopes.get(node, local_scope)
-            dependency_failed = False
-            errors = []
+            for node in tuple(pending):
+                if not _node_dependencies_resolved(node, results):
+                    continue
 
-            for dependency in getattr(node, "__dependencies__", ()):
-                dep_result = results.get(dependency)
+                pending.remove(node)
+                progressed = True
 
-                if dep_result is not None and kungfu.is_err(dep_result):
-                    dependency_failed = True
-                    errors.append(dep_result.error)
+                result = _dependency_failure_result(node, results)
+                if result is not None:
+                    results[node] = result
+                    if result is not None and kungfu.is_err(result) and node in self.final_nodes:
+                        raise result.error
+                    continue
 
-            if dependency_failed and not hasattr(node, "__either__") and not issubclass(node, _result_node_type()):
-                result = kungfu.Error(NodeError(f"could not resolve dependencies of `{node.__name__}`", from_many=errors))
+                i = index_by_node[node]
+                with nogil:
+                    self.native.mark_started(state.state, <size_t> i)
 
-            elif issubclass(node, _result_node_type()):
-                dep_result = results.get(node.__from_node__)
+                node_scope = mapped_scopes.get(node, local_scope)
+                task = _UvWorkTask(self, node, node_scope, local_scope, mapped_scopes, results)
+                task.start(runner)
+                running.append(task)
 
-                if dep_result is None:
-                    result = kungfu.Error(NodeError(f"could not resolve dependencies of `{node.__name__}`"))
-                else:
-                    result = _compose_result_node(node, node_scope, dep_result)
+            completed.clear()
+            for task in running:
+                with nogil:
+                    rc = nodina_uv_work_is_done(task.work)
 
-            elif hasattr(node, "__either__"):
-                result = _compose_either_sync(self, node, node_scope, local_scope, mapped_scopes, results)
+                if rc != 0:
+                    completed.append(task)
 
-            else:
-                result = _compose_sync_node(node, node_scope, local_scope)
+            for task in completed:
+                running.remove(task)
+                node = task.node
+                result = task.result
 
-            results[node] = result
-            if result is not None and result:
-                node_scope[node] = result.unwrap()
+                with nogil:
+                    rc = nodina_uv_work_status(task.work)
 
-            with nogil:
-                self.native.mark_finished(state.state, <size_t> i)
+                if rc != 0:
+                    raise RuntimeError(f"libuv work item failed: {rc}")
 
-            if result is not None and kungfu.is_err(result) and node in self.final_nodes:
-                raise result.error
+                if task.error is not None:
+                    raise task.error
+
+                results[node] = result
+                if result is not None and result:
+                    task.node_scope[node] = result.unwrap()
+
+                i = index_by_node[node]
+                with nogil:
+                    self.native.mark_finished(state.state, <size_t> i)
+
+                if result is not None and kungfu.is_err(result) and node in self.final_nodes:
+                    raise result.error
+
+                progressed = True
+
+            if running:
+                with nogil:
+                    rc = nodina_uv_runner_run_once(runner.runner)
+                if rc < 0:
+                    raise RuntimeError(f"libuv runner failed: {rc}")
+            elif not progressed and pending:
+                node = next(iter(pending))
+                raise NodeError(f"could not resolve dependencies of `{node.__name__}`")
 
 
 cdef class _AsyncRun:
@@ -711,58 +909,83 @@ cdef class AsyncNodinaAgent(AgentMixin, Agent):
         cdef _RunState state = _RunState(len(nodes))
         cdef Py_ssize_t i
         cdef object node
-        cdef object dependency
-        cdef object dep_result
         cdef object result
         cdef object node_scope
-        cdef bint dependency_failed
-        cdef list errors
+        cdef object pending = set(nodes)
+        cdef dict index_by_node = {node: i for i, node in enumerate(nodes)}
+        cdef dict running = {}
+        cdef object done
+        cdef object pending_tasks
+        cdef object task
+        cdef bint progressed
 
-        for i, node in enumerate(nodes):
-            if node in results:
-                continue
+        pending.difference_update(results.keys())
 
-            with nogil:
-                self.native.mark_started(state.state, <size_t> i)
+        while pending or running:
+            progressed = False
 
-            node_scope = mapped_scopes.get(node, local_scope)
-            dependency_failed = False
-            errors = []
+            for node in tuple(pending):
+                if not _node_dependencies_resolved(node, results):
+                    continue
 
-            for dependency in getattr(node, "__dependencies__", ()):
-                dep_result = results.get(dependency)
+                pending.remove(node)
+                progressed = True
 
-                if dep_result is not None and kungfu.is_err(dep_result):
-                    dependency_failed = True
-                    errors.append(dep_result.error)
+                result = _dependency_failure_result(node, results)
+                if result is not None:
+                    results[node] = result
+                    if result is not None and kungfu.is_err(result) and node in self.final_nodes:
+                        raise result.error
+                    continue
 
-            if dependency_failed and not hasattr(node, "__either__") and not issubclass(node, _result_node_type()):
-                result = kungfu.Error(NodeError(f"could not resolve dependencies of `{node.__name__}`", from_many=errors))
+                i = index_by_node[node]
+                with nogil:
+                    self.native.mark_started(state.state, <size_t> i)
 
-            elif issubclass(node, _result_node_type()):
-                dep_result = results.get(node.__from_node__)
-
-                if dep_result is None:
-                    result = kungfu.Error(NodeError(f"could not resolve dependencies of `{node.__name__}`"))
-                else:
-                    result = _compose_result_node(node, node_scope, dep_result)
-            elif hasattr(node, "__either__"):
-                result = yield from _compose_either_async(
-                    self, node, node_scope, local_scope, mapped_scopes, results, runner
+                node_scope = mapped_scopes.get(node, local_scope)
+                task = asyncio.create_task(
+                    _run_async_generator(
+                        _compose_async_node_from_results(
+                            self,
+                            node,
+                            node_scope,
+                            local_scope,
+                            mapped_scopes,
+                            results,
+                            runner,
+                        )
+                    )
                 )
+                running[task] = (node, node_scope)
 
-            else:
-                result = yield from _compose_async_node(node, node_scope, local_scope, runner)
+            if running:
+                done, pending_tasks = yield from asyncio.wait(
+                    tuple(running.keys()),
+                    return_when=asyncio.FIRST_COMPLETED,
+                ).__await__()
 
-            results[node] = result
-            if result is not None and result:
-                node_scope[node] = result.unwrap()
+                for task in done:
+                    node, node_scope = running.pop(task)
+                    result = task.result()
 
-            with nogil:
-                self.native.mark_finished(state.state, <size_t> i)
+                    results[node] = result
+                    if result is not None and result:
+                        node_scope[node] = result.unwrap()
 
-            if result is not None and kungfu.is_err(result) and node in self.final_nodes:
-                raise result.error
+                    i = index_by_node[node]
+                    with nogil:
+                        self.native.mark_finished(state.state, <size_t> i)
+
+                    if result is not None and kungfu.is_err(result) and node in self.final_nodes:
+                        for task in running:
+                            task.cancel()
+                        raise result.error
+
+                    progressed = True
+
+            elif not progressed and pending:
+                node = next(iter(pending))
+                raise NodeError(f"could not resolve dependencies of `{node.__name__}`")
 
 
 __all__ = ("AsyncNodinaAgent", "NodinaAgent", "backend_name")

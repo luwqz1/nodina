@@ -223,6 +223,15 @@ struct nodina_uv_runner {
     int initialized;
 };
 
+struct nodina_uv_work {
+    uv_work_t request;
+    nodina_uv_work_cb work_cb;
+    nodina_uv_after_work_cb after_cb;
+    void *data;
+    int done;
+    int status;
+};
+
 static void nodina_uv_close_walk_cb(uv_handle_t *handle, void *arg)
 {
     (void) arg;
@@ -372,4 +381,84 @@ int nodina_uv_runner_sleep(nodina_uv_runner *runner, uint64_t timeout_ms)
 
     (void) uv_run(&runner->loop, UV_RUN_NOWAIT);
     return 0;
+}
+
+static void nodina_uv_work_cb_dispatch(uv_work_t *request)
+{
+    nodina_uv_work *work = (nodina_uv_work *) request->data;
+
+    if (work->work_cb != NULL) {
+        work->work_cb(work->data);
+    }
+}
+
+static void nodina_uv_after_work_cb_dispatch(uv_work_t *request, int status)
+{
+    nodina_uv_work *work = (nodina_uv_work *) request->data;
+
+    work->status = status;
+    work->done = 1;
+
+    if (work->after_cb != NULL) {
+        work->after_cb(work->data, status);
+    }
+}
+
+int nodina_uv_runner_queue_work(
+    nodina_uv_runner *runner,
+    nodina_uv_work_cb work_cb,
+    nodina_uv_after_work_cb after_cb,
+    void *data,
+    nodina_uv_work **out
+)
+{
+    nodina_uv_work *work;
+    int rc;
+
+    if (runner == NULL || work_cb == NULL || out == NULL) {
+        return -1;
+    }
+
+    *out = NULL;
+    work = (nodina_uv_work *) calloc(1, sizeof(nodina_uv_work));
+    if (work == NULL) {
+        return -2;
+    }
+
+    work->request.data = work;
+    work->work_cb = work_cb;
+    work->after_cb = after_cb;
+    work->data = data;
+
+    rc = uv_queue_work(&runner->loop, &work->request, nodina_uv_work_cb_dispatch, nodina_uv_after_work_cb_dispatch);
+    if (rc != 0) {
+        free(work);
+        return rc;
+    }
+
+    *out = work;
+    return 0;
+}
+
+int nodina_uv_work_is_done(const nodina_uv_work *work)
+{
+    if (work == NULL) {
+        return 0;
+    }
+
+    return work->done != 0;
+}
+
+int nodina_uv_work_status(const nodina_uv_work *work)
+{
+    if (work == NULL) {
+        return -1;
+    }
+
+    return work->status;
+}
+
+void nodina_uv_work_free(nodina_uv_work *work)
+{
+    free(work);
 }

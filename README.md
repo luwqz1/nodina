@@ -1,7 +1,7 @@
 <div align="center">
   <a href="https://github.com/luwqz1/nodina"><img src="https://raw.githubusercontent.com/luwqz1/nodina/refs/heads/main/assets/logo.svg" alt="Nodina Logo" width="250" height="200"></a>
 
-  <i>Ultra fast agents for nodnod for <a href="https://github.com/timoniq/nodnod">nodnod</i></a> \
+  <i>Ultra fast agents for <a href="https://github.com/timoniq/nodnod">nodnod</i></a> \
   <i>We make a <a href="https://github.com/timoniq/nodnod">nodnod</a> family</i> 🧑‍🧑‍🧒‍🧒
 </div>
 

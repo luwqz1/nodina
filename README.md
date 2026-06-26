@@ -17,7 +17,7 @@ from nodina import AsyncNodinaAgent, Scope, scalar_node
 class Hello:
     @classmethod
     async def __compose__(cls) -> str:
-        return "Hello, "
+        return "Hello,"
 
 
 @scalar_node

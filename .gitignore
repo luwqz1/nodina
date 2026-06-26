@@ -2,9 +2,10 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+.venv-ft/
 .cache/
 build/
 dist/
 *.egg-info/
 *.so
-_agent.c
+nodina/_agent.c

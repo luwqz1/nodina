@@ -1,359 +1,183 @@
 # cython: language_level=3str
 # cython: boundscheck=False
 # cython: wraparound=False
-# cython: initializedcheck=False
+# cython: freethreading_compatible=True
 
-from cpython.mem cimport PyMem_Free, PyMem_Malloc
-from cpython.ref cimport PyObject
-from libc.stddef cimport size_t
-from libc.stdint cimport uint64_t
+"""Cython nodina agents backed by a native (libuv-free) pthread pool.
 
-import inspect
+The DAG resolution is written once as a generator-based compose core; the sync
+agent drives it to completion on a worker thread, the async agent awaits it on
+the event loop. Independent sync nodes are dispatched to a shared pthread pool
+(`nodina/core/nodina_pool.c`) whose queueing and waiting run WITHOUT the GIL --
+the GIL is held only inside each `__compose__` call. On a normal CPython build
+that overlaps blocking nodes (CPU nodes still serialize on the GIL); on a
+free-threaded build the compose callbacks run truly in parallel.
+"""
+
 import asyncio
+import inspect
+import os
+import threading
 import types
 
 import kungfu
-
 from nodnod.agent import Agent
 from nodnod.error import NodeError
+from nodnod.interface.result_node import ResultNode
 from nodnod.scope import validate_local_scope_is_linked_to_node_scopes
 from nodnod.utils.generator import generator_asend, generator_send
 from nodnod.value import Value
 
+from cpython.ref cimport Py_INCREF, Py_DECREF, PyObject
+
 from ._core cimport (
-    NODINA_NODE_CONCURRENT_EITHER,
-    NODINA_NODE_EITHER,
-    NODINA_NODE_RESULT,
-    nodina_mutex,
-    nodina_mutex_free,
-    nodina_mutex_lock,
-    nodina_mutex_new,
-    nodina_mutex_unlock,
-    nodina_plan,
-    nodina_plan_free,
-    nodina_plan_new,
-    nodina_plan_set_node,
-    nodina_run_state,
-    nodina_run_state_free,
-    nodina_run_state_mark_finished,
-    nodina_run_state_mark_started,
-    nodina_run_state_new,
-    nodina_uv_available,
-    nodina_uv_backend_name,
-    nodina_uv_work,
-    nodina_uv_work_free,
-    nodina_uv_work_is_done,
-    nodina_uv_work_status,
-    nodina_uv_runner,
-    nodina_uv_runner_free,
-    nodina_uv_runner_new,
-    nodina_uv_runner_queue_work,
-    nodina_uv_runner_run_once,
-    nodina_uv_runner_sleep,
+    nodina_pool,
+    nodina_pool_completed,
+    nodina_pool_new,
+    nodina_pool_submit,
+    nodina_pool_wait,
 )
 
-cdef object _Either = None
-cdef object _ResultNode = None
+_BACKEND_NAME = "cython"
+
+cdef nodina_pool *_POOL = NULL
+_pool_lock = threading.Lock()
+_tls = threading.local()
 
 
-cdef object _either_type():
-    global _Either
-
-    if _Either is None:
-        from nodnod.interface.either import Either
-
-        _Either = Either
-
-    return _Either
-
-
-cdef object _result_node_type():
-    global _ResultNode
-
-    if _ResultNode is None:
-        from nodnod.interface.result_node import ResultNode
-
-        _ResultNode = ResultNode
-
-    return _ResultNode
+cdef int _default_threads() except -1:
+    env = os.environ.get("NODINA_POOL_THREADS")
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    cpu = os.cpu_count() or 4
+    return min(32, max(4, <int> cpu + 4))
 
 
-cdef inline void _lock(nodina_mutex *mutex) noexcept nogil:
-    nodina_mutex_lock(mutex)
+cdef nodina_pool *_get_pool() except NULL:
+    global _POOL
+    if _POOL == NULL:
+        # Double-checked locking: safe even if first use races across threads
+        # on a free-threaded build.
+        with _pool_lock:
+            if _POOL == NULL:
+                _POOL = nodina_pool_new(_default_threads())
+                if _POOL == NULL:
+                    raise MemoryError("could not create nodina threadpool")
+    return _POOL
 
 
-cdef inline void _unlock(nodina_mutex *mutex) noexcept nogil:
-    nodina_mutex_unlock(mutex)
-
-
-def libuv_available():
-    cdef int available
-
-    with nogil:
-        available = nodina_uv_available()
-
-    return available != 0
+cdef bint _on_worker():
+    return getattr(_tls, "on_worker", False)
 
 
 def backend_name():
-    cdef const char *name
-
-    with nogil:
-        name = nodina_uv_backend_name()
-
-    return name.decode("ascii")
+    return _BACKEND_NAME
 
 
-cdef class _NativePlan:
-    cdef nodina_plan *plan
-    cdef dict index_by_node
-    cdef tuple nodes
-    cdef tuple final_nodes
-    cdef nodina_mutex *mutex
-    cdef bint mutex_ready
-
-    def __cinit__(self):
-        self.plan = NULL
-        self.mutex = NULL
-        self.mutex_ready = False
-
-    def __init__(self, object traversed_nodes, object final_nodes):
-        cdef Py_ssize_t i
-        cdef int rc
-        cdef list nodes_list = []
-        cdef dict seen = {}
-        cdef object node
-
-        for node in traversed_nodes:
-            if node in seen:
-                continue
-
-            seen[node] = len(nodes_list)
-            nodes_list.append(node)
-
-        self.nodes = tuple(nodes_list)
-        self.index_by_node = seen
-        self.final_nodes = tuple(final_nodes) if final_nodes is not None else self.nodes
-
-        rc = nodina_mutex_new(&self.mutex)
-        if rc != 0:
-            raise MemoryError(f"could not initialize nodina mutex: {rc}")
-
-        self.mutex_ready = True
-
-        rc = nodina_plan_new(<size_t> len(self.nodes), &self.plan)
-        if rc != 0:
-            raise MemoryError(f"could not allocate nodina plan: {rc}")
-
-        for i, node in enumerate(self.nodes):
-            self._set_node(<size_t> i, node)
-
-    cdef void _set_node(self, size_t index, object node):
-        cdef list dep_indexes = []
-        cdef object dep
-        cdef size_t dep_count
-        cdef size_t *raw_deps = NULL
-        cdef Py_ssize_t i
-        cdef int rc
-        cdef unsigned int flags = 0
-
-        if issubclass(node, _either_type()):
-            flags |= NODINA_NODE_EITHER
-
-            if getattr(node, "is_concurrent", False):
-                flags |= NODINA_NODE_CONCURRENT_EITHER
-
-        if issubclass(node, _result_node_type()):
-            flags |= NODINA_NODE_RESULT
-
-        for dep in getattr(node, "__dependencies__", ()):
-            if dep in self.index_by_node:
-                dep_indexes.append(self.index_by_node[dep])
-
-        dep_count = <size_t> len(dep_indexes)
-        if dep_count > 0:
-            raw_deps = <size_t *> PyMem_Malloc(sizeof(size_t) * dep_count)
-
-            if raw_deps == NULL:
-                raise MemoryError("could not allocate dependency index buffer")
-
-            try:
-                for i, dep in enumerate(dep_indexes):
-                    raw_deps[i] = <size_t> dep
-
-                rc = nodina_plan_set_node(
-                    self.plan,
-                    index,
-                    <void *> <PyObject *> node,
-                    raw_deps,
-                    dep_count,
-                    flags,
-                )
-            finally:
-                PyMem_Free(raw_deps)
-        else:
-            rc = nodina_plan_set_node(
-                self.plan,
-                index,
-                <void *> <PyObject *> node,
-                NULL,
-                0,
-                flags,
-            )
-
-        if rc != 0:
-            raise MemoryError(f"could not set nodina plan node: {rc}")
-
-    def __dealloc__(self):
-        if self.plan != NULL:
-            nodina_plan_free(self.plan)
-            self.plan = NULL
-
-        if self.mutex_ready:
-            nodina_mutex_free(self.mutex)
-            self.mutex = NULL
-            self.mutex_ready = False
-
-    @property
-    def traversed_nodes(self):
-        return self.nodes
-
-    cdef void mark_started(self, nodina_run_state *state, size_t index) noexcept nogil:
-        _lock(self.mutex)
-        nodina_run_state_mark_started(state, index)
-        _unlock(self.mutex)
-
-    cdef void mark_finished(self, nodina_run_state *state, size_t index) noexcept nogil:
-        _lock(self.mutex)
-        nodina_run_state_mark_finished(state, index)
-        _unlock(self.mutex)
+def _dedup(traversed_nodes):
+    seen = {}
+    for node in traversed_nodes:
+        if node not in seen:
+            seen[node] = len(seen)
+    return tuple(seen)
 
 
-cdef class _RunState:
-    cdef nodina_run_state *state
-
-    def __cinit__(self):
-        self.state = NULL
-
-    def __init__(self, Py_ssize_t length):
-        cdef int rc
-        rc = nodina_run_state_new(<size_t> length, &self.state)
-        if rc != 0:
-            raise MemoryError(f"could not allocate nodina run state: {rc}")
-
-    def __dealloc__(self):
-        if self.state != NULL:
-            nodina_run_state_free(self.state)
-            self.state = NULL
-
-
-cdef class _UvRunner:
-    cdef nodina_uv_runner *runner
-
-    def __cinit__(self):
-        self.runner = NULL
-
-    def __init__(self):
-        cdef int rc
-        rc = nodina_uv_runner_new(&self.runner)
-        if rc != 0:
-            raise RuntimeError(f"could not initialize libuv runner: {rc}")
-
-    def __dealloc__(self):
-        if self.runner != NULL:
-            nodina_uv_runner_free(self.runner)
-            self.runner = NULL
-
-    cpdef sleep(self, uint64_t timeout_ms):
-        cdef int rc
-
-        with nogil:
-            rc = nodina_uv_runner_sleep(self.runner, timeout_ms)
-
-        if rc != 0:
-            raise RuntimeError(f"libuv sleep failed: {rc}")
-
-
-cdef class _NodinaSleep:
-    cdef uint64_t timeout_ms
-
-    def __init__(self, object timeout_ms):
-        if timeout_ms < 0:
-            raise ValueError("timeout must be >= 0")
-        self.timeout_ms = <uint64_t> timeout_ms
-
-    def __await__(self):
-        yield self
-        return None
-
-
-def sleep(object timeout_ms):
-    return _NodinaSleep(timeout_ms)
+# --- traversal -------------------------------------------------------------
 
 
 cdef tuple _native_traverse(object roots):
     cdef list queue = []
     cdef set seen = set()
     cdef set visiting = set()
-    cdef object root
-
     for root in roots:
         _native_visit(root, queue, seen, visiting)
-
     return tuple(queue)
 
 
-cdef void _native_visit(object node, list queue, set seen, set visiting):
-    cdef object dep
-
+cdef void _native_visit(object node, list queue, set seen, set visiting) except *:
     if node in seen:
         return
-
     if node in visiting:
         raise NodeError(f"circular dependency detected around `{node.__name__}`")
-
     visiting.add(node)
-
     for dep in getattr(node, "__dependencies__", ()):
         _native_visit(dep, queue, seen, visiting)
-
     visiting.remove(node)
     seen.add(node)
     queue.append(node)
 
 
+# --- dependency resolution -------------------------------------------------
+
+
 cdef set _node_dependencies(object node, object local_scope):
     cdef set dependencies = set()
-    cdef object dependency
-    cdef object dep
-    cdef object injected_type
-
     for dependency in node.__dependencies__:
         dep = local_scope.retrieve(dependency)
-
         if dep:
             dependencies.add(dep.unwrap())
-
     for injected_type in node.__injections__:
         dependencies.add(
-            local_scope
-            .retrieve(injected_type)
-            .expect(NodeError(f"couldn't inject `{injected_type.__name__}` because it was not set"))
+            local_scope.retrieve(injected_type).expect(
+                NodeError(f"couldn't inject `{injected_type.__name__}` because it was not set"),
+            ),
         )
-
     return dependencies
 
 
-cdef object _sync_initialize_node(object cls, object value):
-    cdef object generated
+cdef set _either_dependencies(object node, object local_scope, object winner):
+    if winner is not None:
+        return {winner}
+    cdef set dependencies = set()
+    for candidate in node.__either__:
+        dep = local_scope.retrieve(candidate)
+        if dep:
+            dependencies.add(dep.unwrap())
+            break
+    return dependencies
 
+
+cdef list _dependency_errors(object node, object results):
+    return [
+        results[dependency].error
+        for dependency in getattr(node, "__dependencies__", ())
+        if dependency in results and kungfu.is_err(results[dependency])
+    ]
+
+
+cdef bint _node_dependencies_resolved(object node, object results):
+    for dependency in getattr(node, "__dependencies__", ()):
+        if dependency not in results:
+            return False
+    return True
+
+
+cdef object _dependency_failure_result(object node, object results):
+    cdef list errors = _dependency_errors(node, results)
+    if errors and not hasattr(node, "__either__") and not issubclass(node, ResultNode):
+        return kungfu.Error(NodeError(f"could not resolve dependencies of `{node.__name__}`", from_many=errors))
+    return None
+
+
+# --- unified compose core (generators; sync mode never suspends) -----------
+
+
+def _initialize_value(cls, value, async_mode):
     if inspect.isawaitable(value):
-        if hasattr(value, "close"):
-            value.close()
-        raise TypeError(f"`{cls.__name__}` returned an awaitable; use `nodina.AsyncNodinaAgent`")
+        if not async_mode:
+            if hasattr(value, "close"):
+                value.close()
+            raise TypeError(f"`{cls.__name__}` returned an awaitable; use `nodina.AsyncNodinaAgent`")
+        value = yield from value.__await__()
 
     if isinstance(value, types.AsyncGeneratorType):
-        raise TypeError(f"`{cls.__name__}` returned an async generator; use `nodina.AsyncNodinaAgent`")
+        if not async_mode:
+            raise TypeError(f"`{cls.__name__}` returned an async generator; use `nodina.AsyncNodinaAgent`")
+        generated = (yield from generator_asend(value).__await__()).expect("Generator did not generate any value")
+        return Value(cls, generated, generator=value)
 
     if isinstance(value, types.GeneratorType):
         generated = generator_send(value).expect("Generator did not generate any value")
@@ -362,519 +186,273 @@ cdef object _sync_initialize_node(object cls, object value):
     return Value(cls, value)
 
 
-cdef object _compose_sync_node(object node, object node_scope, object local_scope, object winner=None):
-    cdef object cached
-    cdef object dependencies
-    cdef object candidate
-    cdef object dep
-    cdef object value
-
+def _compose_node(node, node_scope, local_scope, async_mode, winner=None):
     cached = node_scope.retrieve(node)
     if cached:
         return kungfu.Ok(cached.unwrap())
-
     try:
         if hasattr(node, "__either__"):
-            if winner is not None:
-                dependencies = {winner}
-            else:
-                dependencies = set()
-                for candidate in node.__either__:
-                    dep = local_scope.retrieve(candidate)
-                    if dep:
-                        dependencies.add(dep.unwrap())
-                        break
+            dependencies = _either_dependencies(node, local_scope, winner)
         else:
             dependencies = _node_dependencies(node, local_scope)
-
         value = node.__initialize__(dependencies)
-        node_scope[node] = _sync_initialize_node(node.__type__, value)
+        node_scope[node] = yield from _initialize_value(node.__type__, value, async_mode)
     except NodeError as e:
         return kungfu.Error(NodeError(f"failed to compose `{node.__name__}`", from_error=e))
-
     return kungfu.Ok(node_scope[node])
 
 
-cdef object _compose_result_node(object node, object node_scope, object from_result):
-    cdef object value
+def _run_subtree(agent, traverse, local_scope, mapped_scopes, results, async_mode):
+    if async_mode:
+        yield from agent._run_async_nodes(traverse, local_scope, mapped_scopes, results)
+    else:
+        agent._run_sync_nodes(traverse, local_scope, mapped_scopes, results)
 
+
+def _compose_either(agent, node, node_scope, local_scope, mapped_scopes, results, async_mode):
+    """Select the first *successful* either candidate in declared order.
+
+    Same for SequentialEither and ConcurrentEither: nodina does not race by
+    completion time and does not cancel losing candidates. The kinds differ only
+    in scheduling, via the dependency set nodnod derives from ``is_concurrent``
+    (ConcurrentEither lists every candidate as a dependency -> composed
+    concurrently; SequentialEither lists only the first -> composed lazily).
+    """
+    errors = []
+    for dependency in node.__either__:
+        result = results.get(dependency)
+        if result is None:
+            traverse = getattr(dependency, "__traverse__", None)
+            if traverse is None:
+                traverse = _native_traverse({dependency})
+            yield from _run_subtree(agent, traverse, local_scope, mapped_scopes, results, async_mode)
+            result = results.get(dependency)
+        if result is not None and result:
+            scope = mapped_scopes.get(dependency, local_scope)
+            scope[dependency] = result.unwrap()
+            return (yield from _compose_node(node, node_scope, local_scope, async_mode, result.unwrap()))
+        if result is not None:
+            errors.append(result.error)
+    return kungfu.Error(NodeError("no option found for either", from_many=errors))
+
+
+cdef object _compose_result_node(object node, object node_scope, object from_result):
     if kungfu.is_err(from_result):
         if not node.__compose__(from_result.error):
             raise from_result.error
         value = Value(node.__type__, from_result)
     else:
         value = Value(node.__type__, kungfu.Ok(from_result.value.value))
-
     node_scope[node] = value
     return kungfu.Ok(value)
 
 
-cdef object _compose_either_sync(
-    object agent,
-    object node,
-    object node_scope,
-    object local_scope,
-    object mapped_scopes,
-    object results,
-):
-    cdef list errors = []
-    cdef object dependency
-    cdef object result
-    cdef object scope
-    cdef object traverse
-
-    # Concurrent Either cannot race without a scheduler. In the no-asyncio
-    # runtime it is resolved by first successful candidate in declared order.
-    for dependency in node.__either__:
-        result = results.get(dependency)
-        if result is None:
-            traverse = getattr(dependency, "__traverse__", None)
-            if traverse is None:
-                traverse = _native_traverse({dependency})
-            agent._run_sync_nodes(traverse, local_scope, mapped_scopes, results)
-            result = results.get(dependency)
-
-        if result is not None and result:
-            scope = mapped_scopes.get(dependency, local_scope)
-            scope[dependency] = result.unwrap()
-            return _compose_sync_node(node, node_scope, local_scope, result.unwrap())
-
-        if result is not None:
-            errors.append(result.error)
-
-    return kungfu.Error(NodeError("no option found for either", from_many=errors))
-
-
-cdef object _dependency_errors(object node, object results):
-    cdef list errors = []
-    cdef object dependency
-    cdef object dep_result
-
-    for dependency in getattr(node, "__dependencies__", ()):
-        dep_result = results.get(dependency)
-
-        if dep_result is not None and kungfu.is_err(dep_result):
-            errors.append(dep_result.error)
-
-    return errors
-
-
-cdef bint _node_dependencies_resolved(object node, object results):
-    cdef object dependency
-
-    for dependency in getattr(node, "__dependencies__", ()):
-        if dependency not in results:
-            return False
-
-    return True
-
-
-cdef object _dependency_failure_result(object node, object results):
-    cdef list errors = _dependency_errors(node, results)
-
-    if errors and not hasattr(node, "__either__") and not issubclass(node, _result_node_type()):
-        return kungfu.Error(NodeError(f"could not resolve dependencies of `{node.__name__}`", from_many=errors))
-
-    return None
-
-
-cdef object _compose_sync_node_from_results(
-    object agent,
-    object node,
-    object node_scope,
-    object local_scope,
-    object mapped_scopes,
-    object results,
-):
-    cdef object dep_result
-
-    if issubclass(node, _result_node_type()):
+def _compose_from_results(agent, node, node_scope, local_scope, mapped_scopes, results, async_mode):
+    if issubclass(node, ResultNode):
         dep_result = results.get(node.__from_node__)
-
         if dep_result is None:
             return kungfu.Error(NodeError(f"could not resolve dependencies of `{node.__name__}`"))
-
         return _compose_result_node(node, node_scope, dep_result)
-
     if hasattr(node, "__either__"):
-        return _compose_either_sync(agent, node, node_scope, local_scope, mapped_scopes, results)
+        return (yield from _compose_either(agent, node, node_scope, local_scope, mapped_scopes, results, async_mode))
+    return (yield from _compose_node(node, node_scope, local_scope, async_mode))
 
-    return _compose_sync_node(node, node_scope, local_scope)
+
+# --- drivers ---------------------------------------------------------------
 
 
-cdef class _UvWorkTask:
-    cdef nodina_uv_work *work
-    cdef object agent
+def _drive_sync(compose):
+    try:
+        compose.send(None)
+    except StopIteration as stop:
+        return stop.value
+    raise RuntimeError("sync composition unexpectedly awaited")  # pragma: no cover
+
+
+def _compose_sync(node, node_scope, local_scope):
+    return _drive_sync(_compose_node(node, node_scope, local_scope, False))
+
+
+class _GenAwaitable:
+    """Adapts a compose generator into an awaitable for asyncio.create_task."""
+
+    def __init__(self, gen):
+        self._gen = gen
+
+    def __await__(self):
+        return (yield from self._gen)
+
+
+async def _as_coroutine(gen):
+    return await _GenAwaitable(gen)
+
+
+# --- native pool task ------------------------------------------------------
+
+
+cdef class _PoolTask:
     cdef object node
     cdef object node_scope
     cdef object local_scope
-    cdef object mapped_scopes
-    cdef object results
     cdef object result
     cdef object error
+    cdef int done
 
-    def __cinit__(self):
-        self.work = NULL
-
-    def __init__(
-        self,
-        object agent,
-        object node,
-        object node_scope,
-        object local_scope,
-        object mapped_scopes,
-        object results,
-    ):
-        self.agent = agent
+    def __cinit__(self, object node, object node_scope, object local_scope):
         self.node = node
         self.node_scope = node_scope
         self.local_scope = local_scope
-        self.mapped_scopes = mapped_scopes
-        self.results = results
         self.result = None
         self.error = None
-
-    def __dealloc__(self):
-        if self.work != NULL:
-            nodina_uv_work_free(self.work)
-            self.work = NULL
-
-    cdef void start(self, _UvRunner runner):
-        cdef int rc
-        cdef nodina_uv_work *work = NULL
-
-        rc = nodina_uv_runner_queue_work(
-            runner.runner,
-            _uv_work_task_run,
-            _uv_work_task_done,
-            <void *> <PyObject *> self,
-            &work,
-        )
-        if rc != 0:
-            raise RuntimeError(f"libuv work queue failed: {rc}")
-
-        self.work = work
+        self.done = 0
 
 
-cdef void _uv_work_task_run(void *data) noexcept with gil:
-    cdef _UvWorkTask task = <_UvWorkTask> data
-
+cdef void _pool_task_run(void *data) noexcept with gil:
+    cdef _PoolTask task = <_PoolTask> data
+    _tls.on_worker = True
     try:
-        task.result = _compose_sync_node_from_results(
-            task.agent,
-            task.node,
-            task.node_scope,
-            task.local_scope,
-            task.mapped_scopes,
-            task.results,
-        )
-    except BaseException as exc:
+        task.result = _compose_sync(task.node, task.node_scope, task.local_scope)
+    except BaseException as exc:  # noqa: BLE001 - propagated to the scheduler thread
         task.error = exc
+    task.done = 1
+    Py_DECREF(task)  # release the reference taken at submit time
 
 
-cdef void _uv_work_task_done(void *data, int status) noexcept with gil:
-    pass
+# --- agents ----------------------------------------------------------------
 
 
-def _drive_awaitable(object awaitable, _UvRunner runner):
-    cdef object iterator
-    cdef object yielded = None
-    cdef object send_value = None
-
-    iterator = awaitable.__await__()
-
-    while True:
-        try:
-            yielded = iterator.send(send_value)
-            send_value = None
-        except StopIteration as stop:
-            return stop.value
-
-        if isinstance(yielded, _NodinaSleep):
-            send_value = yield from asyncio.sleep((<_NodinaSleep> yielded).timeout_ms / 1000).__await__()
-            continue
-
-        if yielded is None:
-            send_value = yield None
-            continue
-
-        if asyncio.isfuture(yielded):
-            send_value = yield from yielded.__await__()
-            continue
-
-        if inspect.isawaitable(yielded):
-            send_value = yield from _drive_awaitable(yielded, runner)
-            continue
-
-        send_value = yield yielded
-
-
-def _async_initialize_node(object cls, object value, _UvRunner runner):
-    cdef object generated
-
-    if inspect.isawaitable(value):
-        value = yield from _drive_awaitable(value, runner)
-
-    if isinstance(value, types.GeneratorType):
-        generated = generator_send(value).expect("Generator did not generate any value")
-        return Value(cls, generated, generator=value)
-
-    if isinstance(value, types.AsyncGeneratorType):
-        generated = (yield from _drive_awaitable(generator_asend(value), runner)).expect(
-            "Generator did not generate any value"
-        )
-        return Value(cls, generated, generator=value)
-
-    return Value(cls, value)
-
-
-def _compose_async_node(object node, object node_scope, object local_scope, _UvRunner runner, object winner=None):
-    cdef object cached
-    cdef object dependencies
-    cdef object candidate
-    cdef object dep
-    cdef object value
-
-    cached = node_scope.retrieve(node)
-    if cached:
-        return kungfu.Ok(cached.unwrap())
-
-    try:
-        if hasattr(node, "__either__"):
-            if winner is not None:
-                dependencies = {winner}
-            else:
-                dependencies = set()
-
-                for candidate in node.__either__:
-                    dep = local_scope.retrieve(candidate)
-
-                    if dep:
-                        dependencies.add(dep.unwrap())
-                        break
-        else:
-            dependencies = _node_dependencies(node, local_scope)
-
-        value = node.__initialize__(dependencies)
-        node_scope[node] = yield from _async_initialize_node(node.__type__, value, runner)
-    except NodeError as e:
-        return kungfu.Error(NodeError(f"failed to compose `{node.__name__}`", from_error=e))
-
-    return kungfu.Ok(node_scope[node])
-
-
-def _compose_either_async(
-    object agent,
-    object node,
-    object node_scope,
-    object local_scope,
-    object mapped_scopes,
-    object results,
-    _UvRunner runner,
-):
-    cdef list errors = []
-    cdef object dependency
-    cdef object result
-    cdef object scope
-    cdef object traverse
-
-    for dependency in node.__either__:
-        result = results.get(dependency)
-
-        if result is None:
-            traverse = getattr(dependency, "__traverse__", None)
-
-            if traverse is None:
-                traverse = _native_traverse({dependency})
-
-            yield from agent._run_async_nodes(traverse, local_scope, mapped_scopes, results, runner)
-            result = results.get(dependency)
-
-        if result is not None and result:
-            scope = mapped_scopes.get(dependency, local_scope)
-            scope[dependency] = result.unwrap()
-            return (yield from _compose_async_node(node, node_scope, local_scope, runner, result.unwrap()))
-
-        if result is not None:
-            errors.append(result.error)
-
-    return kungfu.Error(NodeError("no option found for either", from_many=errors))
-
-
-def _compose_async_node_from_results(
-    object agent,
-    object node,
-    object node_scope,
-    object local_scope,
-    object mapped_scopes,
-    object results,
-    _UvRunner runner,
-):
-    cdef object dep_result
-
-    if issubclass(node, _result_node_type()):
-        dep_result = results.get(node.__from_node__)
-
-        if dep_result is None:
-            return kungfu.Error(NodeError(f"could not resolve dependencies of `{node.__name__}`"))
-
-        return _compose_result_node(node, node_scope, dep_result)
-
-    if hasattr(node, "__either__"):
-        return (yield from _compose_either_async(agent, node, node_scope, local_scope, mapped_scopes, results, runner))
-
-    return (yield from _compose_async_node(node, node_scope, local_scope, runner))
-
-
-@types.coroutine
-def _run_async_generator(object awaitable):
-    return (yield from awaitable)
-
-
-cdef class AgentMixin:
+class AgentMixin:
     @classmethod
     def build(cls, nodes):
         return cls(_native_traverse(nodes), final_nodes=nodes)
 
 
-cdef class NodinaAgent(AgentMixin, Agent):
-    cdef _NativePlan native
-    cdef object traversed_nodes
-    cdef object final_nodes
-    cdef dict __dict__
-
-    def __init__(self, object traversed_nodes, object final_nodes=None):
-        self.native = _NativePlan(traversed_nodes, final_nodes if final_nodes is not None else traversed_nodes)
-        self.traversed_nodes = self.native.traversed_nodes
+class NodinaAgent(AgentMixin, Agent):
+    def __init__(self, traversed_nodes, final_nodes=None):
+        self.traversed_nodes = _dedup(traversed_nodes)
         self.final_nodes = set(final_nodes) if final_nodes is not None else set(self.traversed_nodes)
 
     def run(self, local_scope, mapped_scopes):
         validate_local_scope_is_linked_to_node_scopes(local_scope, mapped_scopes)
-
-        cdef dict results = {}
+        results = {}
         self._run_sync_nodes(self.traversed_nodes, local_scope, mapped_scopes, results)
-
-        cdef object node
-        cdef object result
-
         for node in self.final_nodes:
             result = results.get(node)
-
             if result is not None and kungfu.is_err(result):
                 raise result.error
 
-    cpdef _run_sync_nodes(self, object nodes, object local_scope, object mapped_scopes, object results):
-        cdef _RunState state = _RunState(len(nodes))
-        cdef Py_ssize_t i
-        cdef object node
-        cdef object result
-        cdef object node_scope
-        cdef object pending = set(nodes)
-        cdef dict index_by_node = {node: i for i, node in enumerate(nodes)}
+    def _run_sync_nodes(self, nodes, local_scope, mapped_scopes, results):
+        cdef nodina_pool *pool = _get_pool()
+        cdef bint inline_only = _on_worker()
+        cdef unsigned long long cursor
+        cdef _PoolTask task
+        cdef list pending = [node for node in nodes if node not in results]
+        cdef set pending_set = set(pending)
         cdef list running = []
-        cdef list completed = []
-        cdef _UvRunner runner = _UvRunner()
-        cdef _UvWorkTask task
-        cdef int rc
+        cdef list ready_plain
+        cdef list remaining
         cdef bint progressed
+        cdef bint harvested
 
-        pending.difference_update(results.keys())
-
-        while pending or running:
+        while pending_set or running:
             progressed = False
+            ready_plain = []
 
-            for node in tuple(pending):
-                if not _node_dependencies_resolved(node, results):
+            for node in pending:
+                if node not in pending_set or not _node_dependencies_resolved(node, results):
                     continue
 
-                pending.remove(node)
+                pending_set.discard(node)
                 progressed = True
 
-                result = _dependency_failure_result(node, results)
-                if result is not None:
-                    results[node] = result
-                    if result is not None and kungfu.is_err(result) and node in self.final_nodes:
-                        raise result.error
+                failure = _dependency_failure_result(node, results)
+                if failure is not None:
+                    results[node] = failure
+                    if kungfu.is_err(failure) and node in self.final_nodes:
+                        raise failure.error
                     continue
 
-                i = index_by_node[node]
-                with nogil:
-                    self.native.mark_started(state.state, <size_t> i)
+                # Either/result resolution can recurse into _run_sync_nodes, so it
+                # runs inline on this thread (never a pool worker).
+                if issubclass(node, ResultNode) or hasattr(node, "__either__"):
+                    node_scope = mapped_scopes.get(node, local_scope)
+                    result = _compose_from_results(self, node, node_scope, local_scope, mapped_scopes, results, False)
+                    result = _drive_sync(result)
+                    self._record(node, node_scope, result, results)
+                else:
+                    ready_plain.append(node)
 
+            if inline_only:
+                # On a pool worker (nested run): never re-enter the pool.
+                for node in ready_plain:
+                    node_scope = mapped_scopes.get(node, local_scope)
+                    self._record(node, node_scope, _compose_sync(node, node_scope, local_scope), results)
+            elif len(ready_plain) == 1 and not running:
+                # Lone ready node, nothing in flight (e.g. a chain): skip the pool.
+                node = ready_plain[0]
                 node_scope = mapped_scopes.get(node, local_scope)
-                task = _UvWorkTask(self, node, node_scope, local_scope, mapped_scopes, results)
-                task.start(runner)
-                running.append(task)
-
-            completed.clear()
-            for task in running:
-                with nogil:
-                    rc = nodina_uv_work_is_done(task.work)
-
-                if rc != 0:
-                    completed.append(task)
-
-            for task in completed:
-                running.remove(task)
-                node = task.node
-                result = task.result
-
-                with nogil:
-                    rc = nodina_uv_work_status(task.work)
-
-                if rc != 0:
-                    raise RuntimeError(f"libuv work item failed: {rc}")
-
-                if task.error is not None:
-                    raise task.error
-
-                results[node] = result
-                if result is not None and result:
-                    task.node_scope[node] = result.unwrap()
-
-                i = index_by_node[node]
-                with nogil:
-                    self.native.mark_finished(state.state, <size_t> i)
-
-                if result is not None and kungfu.is_err(result) and node in self.final_nodes:
-                    raise result.error
-
-                progressed = True
+                self._record(node, node_scope, _compose_sync(node, node_scope, local_scope), results)
+            else:
+                for node in ready_plain:
+                    node_scope = mapped_scopes.get(node, local_scope)
+                    task = _PoolTask(node, node_scope, local_scope)
+                    running.append(task)
+                    Py_INCREF(task)  # the pool borrows a reference until the task runs
+                    if nodina_pool_submit(pool, _pool_task_run, <void *> <PyObject *> task) != 0:
+                        Py_DECREF(task)
+                        raise MemoryError("could not submit task to nodina pool")
 
             if running:
-                with nogil:
-                    rc = nodina_uv_runner_run_once(runner.runner)
-                if rc < 0:
-                    raise RuntimeError(f"libuv runner failed: {rc}")
-            elif not progressed and pending:
-                node = next(iter(pending))
+                # Wait (without the GIL) for >=1 task, then harvest every task
+                # that is done in a single O(n) pass and hand control back to the
+                # top so newly-unblocked nodes get dispatched.
+                cursor = nodina_pool_completed(pool)
+                while True:
+                    remaining = []
+                    harvested = False
+                    for item in running:
+                        task = <_PoolTask> item
+                        if task.done:
+                            harvested = True
+                            if task.error is not None:
+                                raise task.error
+                            self._record(task.node, task.node_scope, task.result, results)
+                            progressed = True
+                        else:
+                            remaining.append(item)
+                    running = remaining
+                    if harvested or not running:
+                        break
+                    with nogil:
+                        nodina_pool_wait(pool, &cursor)
+
+            elif not progressed and pending_set:
+                node = next(iter(pending_set))
                 raise NodeError(f"could not resolve dependencies of `{node.__name__}`")
 
+            pending = [node for node in pending if node in pending_set]
 
-cdef class _AsyncRun:
-    cdef AsyncNodinaAgent agent
-    cdef object local_scope
-    cdef object mapped_scopes
+    def _record(self, node, node_scope, result, results):
+        results[node] = result
+        if result is not None and result:
+            node_scope[node] = result.unwrap()
+        if result is not None and kungfu.is_err(result) and node in self.final_nodes:
+            raise result.error
 
-    def __init__(self, AsyncNodinaAgent agent, object local_scope, object mapped_scopes):
+
+class _AsyncRun:
+    def __init__(self, agent, local_scope, mapped_scopes):
         self.agent = agent
         self.local_scope = local_scope
         self.mapped_scopes = mapped_scopes
 
     def __await__(self):
         yield from self.agent._run_now(self.local_scope, self.mapped_scopes)
-        return None
 
 
-cdef class AsyncNodinaAgent(AgentMixin, Agent):
-    cdef _NativePlan native
-    cdef object traversed_nodes
-    cdef object final_nodes
-    cdef dict __dict__
-
-    def __init__(self, object traversed_nodes, object final_nodes=None):
-        self.native = _NativePlan(traversed_nodes, final_nodes if final_nodes is not None else traversed_nodes)
-        self.traversed_nodes = self.native.traversed_nodes
+class AsyncNodinaAgent(AgentMixin, Agent):
+    def __init__(self, traversed_nodes, final_nodes=None):
+        self.traversed_nodes = _dedup(traversed_nodes)
         self.final_nodes = set(final_nodes) if final_nodes is not None else set(self.traversed_nodes)
 
     def run(self, local_scope, mapped_scopes, futures=None):
@@ -882,44 +460,19 @@ cdef class AsyncNodinaAgent(AgentMixin, Agent):
             raise TypeError("`nodina.AsyncNodinaAgent` does not accept asyncio futures.")
         return _AsyncRun(self, local_scope, mapped_scopes)
 
-    def _run_now(self, object local_scope, object mapped_scopes):
+    def _run_now(self, local_scope, mapped_scopes):
         validate_local_scope_is_linked_to_node_scopes(local_scope, mapped_scopes)
-
-        cdef dict results = {}
-        cdef _UvRunner runner = _UvRunner()
-        yield from self._run_async_nodes(self.traversed_nodes, local_scope, mapped_scopes, results, runner)
-
-        cdef object node
-        cdef object result
-
+        results = {}
+        yield from self._run_async_nodes(self.traversed_nodes, local_scope, mapped_scopes, results)
         for node in self.final_nodes:
             result = results.get(node)
-
             if result is not None and kungfu.is_err(result):
                 raise result.error
 
-    def _run_async_nodes(
-        self,
-        object nodes,
-        object local_scope,
-        object mapped_scopes,
-        object results,
-        _UvRunner runner,
-    ):
-        cdef _RunState state = _RunState(len(nodes))
-        cdef Py_ssize_t i
-        cdef object node
-        cdef object result
-        cdef object node_scope
-        cdef object pending = set(nodes)
-        cdef dict index_by_node = {node: i for i, node in enumerate(nodes)}
-        cdef dict running = {}
-        cdef object done
-        cdef object pending_tasks
-        cdef object task
-        cdef bint progressed
-
+    def _run_async_nodes(self, nodes, local_scope, mapped_scopes, results):
+        pending = set(nodes)
         pending.difference_update(results.keys())
+        running = {}
 
         while pending or running:
             progressed = False
@@ -934,32 +487,20 @@ cdef class AsyncNodinaAgent(AgentMixin, Agent):
                 result = _dependency_failure_result(node, results)
                 if result is not None:
                     results[node] = result
-                    if result is not None and kungfu.is_err(result) and node in self.final_nodes:
+                    if kungfu.is_err(result) and node in self.final_nodes:
                         raise result.error
                     continue
 
-                i = index_by_node[node]
-                with nogil:
-                    self.native.mark_started(state.state, <size_t> i)
-
                 node_scope = mapped_scopes.get(node, local_scope)
                 task = asyncio.create_task(
-                    _run_async_generator(
-                        _compose_async_node_from_results(
-                            self,
-                            node,
-                            node_scope,
-                            local_scope,
-                            mapped_scopes,
-                            results,
-                            runner,
-                        )
-                    )
+                    _as_coroutine(
+                        _compose_from_results(self, node, node_scope, local_scope, mapped_scopes, results, True),
+                    ),
                 )
                 running[task] = (node, node_scope)
 
             if running:
-                done, pending_tasks = yield from asyncio.wait(
+                done, _ = yield from asyncio.wait(
                     tuple(running.keys()),
                     return_when=asyncio.FIRST_COMPLETED,
                 ).__await__()
@@ -972,13 +513,9 @@ cdef class AsyncNodinaAgent(AgentMixin, Agent):
                     if result is not None and result:
                         node_scope[node] = result.unwrap()
 
-                    i = index_by_node[node]
-                    with nogil:
-                        self.native.mark_finished(state.state, <size_t> i)
-
                     if result is not None and kungfu.is_err(result) and node in self.final_nodes:
-                        for task in running:
-                            task.cancel()
+                        for pending_task in running:
+                            pending_task.cancel()
                         raise result.error
 
                     progressed = True

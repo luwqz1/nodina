@@ -17,7 +17,7 @@ from nodina import (
 
 
 def test_backend_name_is_available():
-    assert backend_name() == "libuv"
+    assert backend_name() == "threadpool"
 
 
 def test_nodina_agent_runs_sync_dependencies():

@@ -1,7 +1,7 @@
 <div align="center">
   <a href="https://github.com/luwqz1/nodina"><img src="https://raw.githubusercontent.com/luwqz1/nodina/refs/heads/main/assets/logo.svg" alt="Nodina Logo" width="250" height="200"></a>
 
-  <i>asyncio / threadpool DAG scheduler agents for <a href="https://github.com/timoniq/nodnod">nodnod</i></a> \
+  <i>Ultra fast agents for nodnod for <a href="https://github.com/timoniq/nodnod">nodnod</i></a> \
   <i>We make a <a href="https://github.com/timoniq/nodnod">nodnod</a> family</i> 🧑‍🧑‍🧒‍🧒
 </div>
 
@@ -41,8 +41,8 @@ asyncio.run(main())
 
 ## How it works
 
-nodina is a small DAG scheduler for [nodnod](https://github.com/timoniq/nodnod)
-graphs, built as a Cython extension over a tiny native (libuv-free) pthread work
+`nodina` is a small DAG scheduler for [nodnod](https://github.com/timoniq/nodnod)
+graphs, built as a Cython extension over a tiny native pthread work
 pool. It ships two agents:
 
 - **`AsyncNodinaAgent`** resolves the dependency graph on the running asyncio
@@ -50,7 +50,7 @@ pool. It ships two agents:
   awaits real I/O) run concurrently.
 - **`NodinaAgent`** resolves it synchronously, dispatching independent nodes onto
   a shared pthread pool (`nodina/core/nodina_pool.c`). The pool's queueing and
-  waiting run **without the GIL** — the GIL is held only inside each `__compose__`
+  waiting run **without the GIL** — the `GIL` is held only inside each `__compose__`
   call. A lone ready node with nothing else in flight composes inline to skip a
   thread hand-off.
 
@@ -77,7 +77,7 @@ python3.14t  (no GIL): 8 nodes =  40 ms   speedup vs serial 5.1x
 ```
 
 ```bash
-uv run python -m benchmarks.bench               # vs a pure-Python reference
+python -m benchmarks.bench               # vs a pure-Python reference
 python3.14t -m benchmarks.freethreading_demo    # CPU parallelism with the GIL off
 ```
 

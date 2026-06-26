@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nodina"
 version = "0.1.0"
-description = "asyncio/threadpool DAG scheduler agents for nodnod"
+description = "Ultra fast agents for nodnod."
 readme = "README.md"
 requires-python = ">=3.13,<4.0"
 dependencies = [

@@ -3,10 +3,7 @@
 # cython: wraparound=False
 # cython: initializedcheck=False
 
-from cpython.mem cimport PyMem_Free, PyMem_Malloc
 from cpython.ref cimport PyObject
-from libc.stddef cimport size_t
-from libc.stdint cimport uint64_t
 
 import inspect
 import asyncio
@@ -21,24 +18,6 @@ from nodnod.utils.generator import generator_asend, generator_send
 from nodnod.value import Value
 
 from ._core cimport (
-    NODINA_NODE_CONCURRENT_EITHER,
-    NODINA_NODE_EITHER,
-    NODINA_NODE_RESULT,
-    nodina_mutex,
-    nodina_mutex_free,
-    nodina_mutex_lock,
-    nodina_mutex_new,
-    nodina_mutex_unlock,
-    nodina_plan,
-    nodina_plan_free,
-    nodina_plan_new,
-    nodina_plan_set_node,
-    nodina_run_state,
-    nodina_run_state_free,
-    nodina_run_state_mark_finished,
-    nodina_run_state_mark_started,
-    nodina_run_state_new,
-    nodina_uv_available,
     nodina_uv_backend_name,
     nodina_uv_work,
     nodina_uv_work_free,
@@ -49,22 +28,9 @@ from ._core cimport (
     nodina_uv_runner_new,
     nodina_uv_runner_queue_work,
     nodina_uv_runner_run_once,
-    nodina_uv_runner_sleep,
 )
 
-cdef object _Either = None
 cdef object _ResultNode = None
-
-
-cdef object _either_type():
-    global _Either
-
-    if _Either is None:
-        from nodnod.interface.either import Either
-
-        _Either = Either
-
-    return _Either
 
 
 cdef object _result_node_type():
@@ -78,23 +44,6 @@ cdef object _result_node_type():
     return _ResultNode
 
 
-cdef inline void _lock(nodina_mutex *mutex) noexcept nogil:
-    nodina_mutex_lock(mutex)
-
-
-cdef inline void _unlock(nodina_mutex *mutex) noexcept nogil:
-    nodina_mutex_unlock(mutex)
-
-
-def libuv_available():
-    cdef int available
-
-    with nogil:
-        available = nodina_uv_available()
-
-    return available != 0
-
-
 def backend_name():
     cdef const char *name
 
@@ -105,21 +54,11 @@ def backend_name():
 
 
 cdef class _NativePlan:
-    cdef nodina_plan *plan
     cdef dict index_by_node
     cdef tuple nodes
     cdef tuple final_nodes
-    cdef nodina_mutex *mutex
-    cdef bint mutex_ready
-
-    def __cinit__(self):
-        self.plan = NULL
-        self.mutex = NULL
-        self.mutex_ready = False
 
     def __init__(self, object traversed_nodes, object final_nodes):
-        cdef Py_ssize_t i
-        cdef int rc
         cdef list nodes_list = []
         cdef dict seen = {}
         cdef object node
@@ -135,116 +74,9 @@ cdef class _NativePlan:
         self.index_by_node = seen
         self.final_nodes = tuple(final_nodes) if final_nodes is not None else self.nodes
 
-        rc = nodina_mutex_new(&self.mutex)
-        if rc != 0:
-            raise MemoryError(f"could not initialize nodina mutex: {rc}")
-
-        self.mutex_ready = True
-
-        rc = nodina_plan_new(<size_t> len(self.nodes), &self.plan)
-        if rc != 0:
-            raise MemoryError(f"could not allocate nodina plan: {rc}")
-
-        for i, node in enumerate(self.nodes):
-            self._set_node(<size_t> i, node)
-
-    cdef void _set_node(self, size_t index, object node):
-        cdef list dep_indexes = []
-        cdef object dep
-        cdef size_t dep_count
-        cdef size_t *raw_deps = NULL
-        cdef Py_ssize_t i
-        cdef int rc
-        cdef unsigned int flags = 0
-
-        if issubclass(node, _either_type()):
-            flags |= NODINA_NODE_EITHER
-
-            if getattr(node, "is_concurrent", False):
-                flags |= NODINA_NODE_CONCURRENT_EITHER
-
-        if issubclass(node, _result_node_type()):
-            flags |= NODINA_NODE_RESULT
-
-        for dep in getattr(node, "__dependencies__", ()):
-            if dep in self.index_by_node:
-                dep_indexes.append(self.index_by_node[dep])
-
-        dep_count = <size_t> len(dep_indexes)
-        if dep_count > 0:
-            raw_deps = <size_t *> PyMem_Malloc(sizeof(size_t) * dep_count)
-
-            if raw_deps == NULL:
-                raise MemoryError("could not allocate dependency index buffer")
-
-            try:
-                for i, dep in enumerate(dep_indexes):
-                    raw_deps[i] = <size_t> dep
-
-                rc = nodina_plan_set_node(
-                    self.plan,
-                    index,
-                    <void *> <PyObject *> node,
-                    raw_deps,
-                    dep_count,
-                    flags,
-                )
-            finally:
-                PyMem_Free(raw_deps)
-        else:
-            rc = nodina_plan_set_node(
-                self.plan,
-                index,
-                <void *> <PyObject *> node,
-                NULL,
-                0,
-                flags,
-            )
-
-        if rc != 0:
-            raise MemoryError(f"could not set nodina plan node: {rc}")
-
-    def __dealloc__(self):
-        if self.plan != NULL:
-            nodina_plan_free(self.plan)
-            self.plan = NULL
-
-        if self.mutex_ready:
-            nodina_mutex_free(self.mutex)
-            self.mutex = NULL
-            self.mutex_ready = False
-
     @property
     def traversed_nodes(self):
         return self.nodes
-
-    cdef void mark_started(self, nodina_run_state *state, size_t index) noexcept nogil:
-        _lock(self.mutex)
-        nodina_run_state_mark_started(state, index)
-        _unlock(self.mutex)
-
-    cdef void mark_finished(self, nodina_run_state *state, size_t index) noexcept nogil:
-        _lock(self.mutex)
-        nodina_run_state_mark_finished(state, index)
-        _unlock(self.mutex)
-
-
-cdef class _RunState:
-    cdef nodina_run_state *state
-
-    def __cinit__(self):
-        self.state = NULL
-
-    def __init__(self, Py_ssize_t length):
-        cdef int rc
-        rc = nodina_run_state_new(<size_t> length, &self.state)
-        if rc != 0:
-            raise MemoryError(f"could not allocate nodina run state: {rc}")
-
-    def __dealloc__(self):
-        if self.state != NULL:
-            nodina_run_state_free(self.state)
-            self.state = NULL
 
 
 cdef class _UvRunner:
@@ -263,32 +95,6 @@ cdef class _UvRunner:
         if self.runner != NULL:
             nodina_uv_runner_free(self.runner)
             self.runner = NULL
-
-    cpdef sleep(self, uint64_t timeout_ms):
-        cdef int rc
-
-        with nogil:
-            rc = nodina_uv_runner_sleep(self.runner, timeout_ms)
-
-        if rc != 0:
-            raise RuntimeError(f"libuv sleep failed: {rc}")
-
-
-cdef class _NodinaSleep:
-    cdef uint64_t timeout_ms
-
-    def __init__(self, object timeout_ms):
-        if timeout_ms < 0:
-            raise ValueError("timeout must be >= 0")
-        self.timeout_ms = <uint64_t> timeout_ms
-
-    def __await__(self):
-        yield self
-        return None
-
-
-def sleep(object timeout_ms):
-    return _NodinaSleep(timeout_ms)
 
 
 cdef tuple _native_traverse(object roots):
@@ -576,7 +382,7 @@ cdef void _uv_work_task_done(void *data, int status) noexcept with gil:
     pass
 
 
-def _drive_awaitable(object awaitable, _UvRunner runner):
+def _drive_awaitable(object awaitable):
     cdef object iterator
     cdef object yielded = None
     cdef object send_value = None
@@ -590,10 +396,6 @@ def _drive_awaitable(object awaitable, _UvRunner runner):
         except StopIteration as stop:
             return stop.value
 
-        if isinstance(yielded, _NodinaSleep):
-            send_value = yield from asyncio.sleep((<_NodinaSleep> yielded).timeout_ms / 1000).__await__()
-            continue
-
         if yielded is None:
             send_value = yield None
             continue
@@ -603,24 +405,24 @@ def _drive_awaitable(object awaitable, _UvRunner runner):
             continue
 
         if inspect.isawaitable(yielded):
-            send_value = yield from _drive_awaitable(yielded, runner)
+            send_value = yield from _drive_awaitable(yielded)
             continue
 
         send_value = yield yielded
 
 
-def _async_initialize_node(object cls, object value, _UvRunner runner):
+def _async_initialize_node(object cls, object value):
     cdef object generated
 
     if inspect.isawaitable(value):
-        value = yield from _drive_awaitable(value, runner)
+        value = yield from _drive_awaitable(value)
 
     if isinstance(value, types.GeneratorType):
         generated = generator_send(value).expect("Generator did not generate any value")
         return Value(cls, generated, generator=value)
 
     if isinstance(value, types.AsyncGeneratorType):
-        generated = (yield from _drive_awaitable(generator_asend(value), runner)).expect(
+        generated = (yield from _drive_awaitable(generator_asend(value))).expect(
             "Generator did not generate any value"
         )
         return Value(cls, generated, generator=value)
@@ -628,7 +430,7 @@ def _async_initialize_node(object cls, object value, _UvRunner runner):
     return Value(cls, value)
 
 
-def _compose_async_node(object node, object node_scope, object local_scope, _UvRunner runner, object winner=None):
+def _compose_async_node(object node, object node_scope, object local_scope, object winner=None):
     cdef object cached
     cdef object dependencies
     cdef object candidate
@@ -656,7 +458,7 @@ def _compose_async_node(object node, object node_scope, object local_scope, _UvR
             dependencies = _node_dependencies(node, local_scope)
 
         value = node.__initialize__(dependencies)
-        node_scope[node] = yield from _async_initialize_node(node.__type__, value, runner)
+        node_scope[node] = yield from _async_initialize_node(node.__type__, value)
     except NodeError as e:
         return kungfu.Error(NodeError(f"failed to compose `{node.__name__}`", from_error=e))
 
@@ -670,7 +472,6 @@ def _compose_either_async(
     object local_scope,
     object mapped_scopes,
     object results,
-    _UvRunner runner,
 ):
     cdef list errors = []
     cdef object dependency
@@ -687,13 +488,13 @@ def _compose_either_async(
             if traverse is None:
                 traverse = _native_traverse({dependency})
 
-            yield from agent._run_async_nodes(traverse, local_scope, mapped_scopes, results, runner)
+            yield from agent._run_async_nodes(traverse, local_scope, mapped_scopes, results)
             result = results.get(dependency)
 
         if result is not None and result:
             scope = mapped_scopes.get(dependency, local_scope)
             scope[dependency] = result.unwrap()
-            return (yield from _compose_async_node(node, node_scope, local_scope, runner, result.unwrap()))
+            return (yield from _compose_async_node(node, node_scope, local_scope, result.unwrap()))
 
         if result is not None:
             errors.append(result.error)
@@ -708,7 +509,6 @@ def _compose_async_node_from_results(
     object local_scope,
     object mapped_scopes,
     object results,
-    _UvRunner runner,
 ):
     cdef object dep_result
 
@@ -721,9 +521,9 @@ def _compose_async_node_from_results(
         return _compose_result_node(node, node_scope, dep_result)
 
     if hasattr(node, "__either__"):
-        return (yield from _compose_either_async(agent, node, node_scope, local_scope, mapped_scopes, results, runner))
+        return (yield from _compose_either_async(agent, node, node_scope, local_scope, mapped_scopes, results))
 
-    return (yield from _compose_async_node(node, node_scope, local_scope, runner))
+    return (yield from _compose_async_node(node, node_scope, local_scope))
 
 
 @types.coroutine
@@ -764,13 +564,10 @@ cdef class NodinaAgent(AgentMixin, Agent):
                 raise result.error
 
     cpdef _run_sync_nodes(self, object nodes, object local_scope, object mapped_scopes, object results):
-        cdef _RunState state = _RunState(len(nodes))
-        cdef Py_ssize_t i
         cdef object node
         cdef object result
         cdef object node_scope
         cdef object pending = set(nodes)
-        cdef dict index_by_node = {node: i for i, node in enumerate(nodes)}
         cdef list running = []
         cdef list completed = []
         cdef _UvRunner runner = _UvRunner()
@@ -796,10 +593,6 @@ cdef class NodinaAgent(AgentMixin, Agent):
                     if result is not None and kungfu.is_err(result) and node in self.final_nodes:
                         raise result.error
                     continue
-
-                i = index_by_node[node]
-                with nogil:
-                    self.native.mark_started(state.state, <size_t> i)
 
                 node_scope = mapped_scopes.get(node, local_scope)
                 task = _UvWorkTask(self, node, node_scope, local_scope, mapped_scopes, results)
@@ -831,10 +624,6 @@ cdef class NodinaAgent(AgentMixin, Agent):
                 results[node] = result
                 if result is not None and result:
                     task.node_scope[node] = result.unwrap()
-
-                i = index_by_node[node]
-                with nogil:
-                    self.native.mark_finished(state.state, <size_t> i)
 
                 if result is not None and kungfu.is_err(result) and node in self.final_nodes:
                     raise result.error
@@ -886,8 +675,7 @@ cdef class AsyncNodinaAgent(AgentMixin, Agent):
         validate_local_scope_is_linked_to_node_scopes(local_scope, mapped_scopes)
 
         cdef dict results = {}
-        cdef _UvRunner runner = _UvRunner()
-        yield from self._run_async_nodes(self.traversed_nodes, local_scope, mapped_scopes, results, runner)
+        yield from self._run_async_nodes(self.traversed_nodes, local_scope, mapped_scopes, results)
 
         cdef object node
         cdef object result
@@ -904,15 +692,11 @@ cdef class AsyncNodinaAgent(AgentMixin, Agent):
         object local_scope,
         object mapped_scopes,
         object results,
-        _UvRunner runner,
     ):
-        cdef _RunState state = _RunState(len(nodes))
-        cdef Py_ssize_t i
         cdef object node
         cdef object result
         cdef object node_scope
         cdef object pending = set(nodes)
-        cdef dict index_by_node = {node: i for i, node in enumerate(nodes)}
         cdef dict running = {}
         cdef object done
         cdef object pending_tasks
@@ -938,10 +722,6 @@ cdef class AsyncNodinaAgent(AgentMixin, Agent):
                         raise result.error
                     continue
 
-                i = index_by_node[node]
-                with nogil:
-                    self.native.mark_started(state.state, <size_t> i)
-
                 node_scope = mapped_scopes.get(node, local_scope)
                 task = asyncio.create_task(
                     _run_async_generator(
@@ -952,7 +732,6 @@ cdef class AsyncNodinaAgent(AgentMixin, Agent):
                             local_scope,
                             mapped_scopes,
                             results,
-                            runner,
                         )
                     )
                 )
@@ -971,10 +750,6 @@ cdef class AsyncNodinaAgent(AgentMixin, Agent):
                     results[node] = result
                     if result is not None and result:
                         node_scope[node] = result.unwrap()
-
-                    i = index_by_node[node]
-                    with nogil:
-                        self.native.mark_finished(state.state, <size_t> i)
 
                     if result is not None and kungfu.is_err(result) and node in self.final_nodes:
                         for task in running:

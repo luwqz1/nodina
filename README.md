@@ -17,7 +17,7 @@ from nodina import AsyncNodinaAgent, Scope, scalar_node
 class Hello:
     @classmethod
     async def __compose__(cls) -> str:
-        return "Hello"
+        return "Hello, "
 
 
 @scalar_node
@@ -33,7 +33,7 @@ async def main() -> None:
 
     async with Scope(detail="local") as local_scope:
         await agent.run(local_scope, mapped_scopes)
-        print(local_scope[Hello], ",", local_scope[World])
+        print(local_scope[Hello], local_scope[World])
 
 
 asyncio.run(main())

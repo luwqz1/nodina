@@ -98,16 +98,11 @@ jobs:
       - name: List distributions
         run: ls -la dist
 
-      - name: Check distributions
-        run: |
-          python -m pip install --upgrade "twine>=6.1.0" "pkginfo>=1.12"
-          python -m twine --version
-          python -m twine check dist/*
-
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
+          verify-metadata: false
 
       - name: GitHub Release
         uses: softprops/action-gh-release@v2

@@ -1,4 +1,5 @@
 [tool.cibuildwheel]
+before-build = "pip install cython>=3.0 setuptools>=80 wheel"
 build = "cp313-* cp314-*"
 skip = "pp* *musllinux*"
 build-verbosity = 1

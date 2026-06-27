@@ -60,7 +60,7 @@ wheels = [
 
 [[package]]
 name = "nodina"
-version = "0.1.0"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "nodnod" },
@@ -76,7 +76,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "nodnod", specifier = ">=1.0.2" }]
+requires-dist = [{ name = "nodnod" }]
 
 [package.metadata.requires-dev]
 dev = [
@@ -89,15 +89,15 @@ dev = [
 
 [[package]]
 name = "nodnod"
-version = "1.0.2"
+version = "1.1.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "kungfu-fp" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c6/2e/87649e4aa8da73451cc266419dab846a2cfa38f0e5a03677c70ad57419c8/nodnod-1.0.2.tar.gz", hash = "sha256:b5331d09189723a83ded51ed1ce508c7a5e1b142b52dfe14a29479c6a5fe4d9b", size = 143536, upload-time = "2026-06-07T00:11:00.348Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6d/13/bb38dce545d31acac4a4ad3fb91ce09b43b9a818f853f36ba2f00fde3d9a/nodnod-1.1.0.tar.gz", hash = "sha256:e0acd5432d17436a5a12e4e937c6b413185025da33ffa43b9da76f8d08a5e3f4", size = 152507, upload-time = "2026-06-27T17:32:14.935Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/95/3f/5e66071e0e3245e9598ee3666343ac7c7d1c6191b19c92c14274fb6bb276/nodnod-1.0.2-py3-none-any.whl", hash = "sha256:43933568b47c65147cceca0c1c895c8df3731cbeb4cc7c0eaeb52381bb842b48", size = 35681, upload-time = "2026-06-07T00:10:58.989Z" },
+    { url = "https://files.pythonhosted.org/packages/12/f2/4e063e14444ff0c302619ba17fb1400de36faf976b43be84e610c7de11d2/nodnod-1.1.0-py3-none-any.whl", hash = "sha256:abcab5ceadbed62c423d4680771a9f876bcd559f959d7275b20b67df5e20ea39", size = 41248, upload-time = "2026-06-27T17:32:12.82Z" },
 ]
 
 [[package]]

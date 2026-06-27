@@ -33,7 +33,7 @@ async def main() -> None:
 
     async with Scope(detail="local") as local_scope:
         await agent.run(local_scope, mapped_scopes)
-        print(local_scope[Hello], local_scope[World])
+        print(local_scope[Hello].unbox(), local_scope[World].unbox())
 
 
 asyncio.run(main())

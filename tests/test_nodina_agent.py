@@ -9,6 +9,7 @@ import pytest
 def _gil_enabled() -> bool:
     return sys._is_gil_enabled() if hasattr(sys, "_is_gil_enabled") else True
 
+
 from nodina import (
     AsyncNodinaAgent,
     ConcurrentEither,

@@ -12,6 +12,7 @@ permissions:
 
 env:
   CIBW_CONFIG_FILE: .github/.cibuildwheel.toml
+  CIBW_ARCHS_WINDOWS: AMD64
 
 jobs:
   wheels:
@@ -50,7 +51,7 @@ jobs:
         run: uv tool install cibuildwheel
 
       - name: Build wheels
-        run: uv tool run cibuildwheel --output-dir wheelhouse
+        run: uv tool run cibuildwheel --config-file .github/.cibuildwheel.toml --output-dir wheelhouse
 
       - uses: actions/upload-artifact@v4
         with:
@@ -70,7 +71,7 @@ jobs:
       - name: Build sdist
         run: |
           uv tool install build
-          uv tool run build --sdist --outdir dist
+          uv tool run --from build pyproject-build --sdist --outdir dist
 
       - uses: actions/upload-artifact@v4
         with:
